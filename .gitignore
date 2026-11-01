@@ -1,0 +1,23 @@
+# 构建产物
+dist/
+build/
+*.app
+*.dmg
+*.zip
+QuarkMount
+icon.iconset/
+AppIcon.icns
+
+# 系统垃圾
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# 密钥 / 本地配置（永远不要提交）
+*.token
+.gh_token
+*.env
+
+# 日志与运行时数据
+*.log
