@@ -212,12 +212,14 @@ struct ContentView: View {
                 .foregroundColor(.green)
             Text("一切就绪")
                 .font(.system(size: 17, weight: .semibold))
-            Text("夸克网盘已挂载在 ~/Quark\n开机自动挂载，掉线自动恢复")
+            Text("夸克网盘已挂载在 ~/Quark\n后台守护持有：退出 App 不影响，开机自动挂载，掉线自动恢复")
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
             HStack(spacing: 10) {
                 Button("打开网盘") { state.openFinder() }
+                Button("重新挂载") { state.remount() }
+                    .disabled(state.remountTask != nil)
                 Button("重新扫码") { state.rescan() }
                 Button("卸载", role: .destructive) { state.uninstall() }
             }

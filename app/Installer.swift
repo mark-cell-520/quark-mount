@@ -544,15 +544,49 @@ final class Installer {
         try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: rcloneConf.path)
     }
 
+    /// 确保 LaunchAgent 守护进程已加载且在运行（挂载的持有者）
+    /// 开机竞态、守护被杀、plist 被改坏时，这里负责把它拉起来
+    static func ensureAgentRunning(state: AppState) async {
+        let uid = getuid()
+        let plist = home.appendingPathComponent("Library/LaunchAgents/\(launchLabel).plist")
+        guard fm.fileExists(atPath: plist.path) else { return }   // 未部署：无从拉起
+        // 未加载 → 加载
+        if await shAsync("launchctl list | grep -q '\(launchLabel)'").1 != 0 {
+            _ = await shAsync("launchctl bootstrap gui/\(uid) '\(plist.path)' 2>/dev/null")
+        }
+        // 未运行 → 唤醒（-k 先停后起，幂等安全）
+        if await shAsync("launchctl print gui/\(uid)/\(launchLabel) 2>/dev/null | grep -q 'state = running'").1 != 0 {
+            _ = await shAsync("launchctl kickstart -k gui/\(uid)/\(launchLabel) 2>/dev/null")
+            state.log("后台守护进程未运行，已唤醒")
+        }
+    }
+
     static func mount(state: AppState) async throws {
         // 修复挂载点目录权限（FUSE 卸载后可能留下怪权限）
         _ = await shAsync("mkdir -p '\(mountPoint.path)' && chmod 755 '\(mountPoint.path)'")
-        // 已是本应用管理的挂载才跳过
-        let ours = await shAsync("pgrep -f 'rclone.*QuarkMount/rclone.conf'").1 == 0
-        if await isMountedAsync() && ours {
-            state.log("已挂载，跳过")
-            return
+        // === 挂载归属权：交给 LaunchAgent 守护进程（launchd 名下）===
+        // App 只是控制面板：退出/崩溃/强杀都不影响挂载，重启后由 launchd 恢复
+        await ensureAgentRunning(state: state)
+        var waited = 0
+        while waited < 60 {
+            if await isMountedAsync() {
+                let ours = await shAsync("pgrep -f 'rclone.*QuarkMount/rclone.conf'").1 == 0
+                state.log(ours
+                    ? "已挂载到 ~/Quark（后台守护持有，退出 App 不影响）"
+                    : "已挂载，跳过")
+                return
+            }
+            if waited % 15 == 0 { state.log("等待后台守护进程挂载…（\(waited)s）") }
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+            waited += 1
         }
+        // 守护进程还活着却挂不上：不能和它抢（pkill 会误杀它的 rclone），交给它自己恢复
+        if await shAsync("pgrep -f 'QuarkMount/start-all.sh'").1 == 0 {
+            let (log, _) = await shAsync("tail -5 '\(base.appendingPathComponent("mount.log").path)' 2>/dev/null")
+            throw InstallError(message: "后台守护进程未能完成挂载，请重启电脑后重试。日志：\(log.prefix(200))")
+        }
+        // === 兜底：守护进程确实不在（plist 缺失/被禁用），App 自己挂 ===
+        state.log("后台守护不可用，由 App 直接挂载")
         // 卸载残留（旧部署的挂载）——优雅优先，强卸载会让 rclone 卡死占住目录
         if await isMountedAsync() {
             state.log("卸载旧挂载以切换到本应用管理…")
@@ -600,6 +634,11 @@ final class Installer {
 
         if await attemptMount() {
             state.log("已挂载到 ~/Quark")
+            return
+        }
+        // 竞态复查：等待期间守护进程可能刚好挂上（别把它的 rclone 当残留杀掉）
+        if await isMountedAsync() {
+            state.log("已挂载到 ~/Quark（后台守护持有，退出 App 不影响）")
             return
         }
         // EBUSY 恢复：残留的 rclone 守护进程卡在内核退出态占住挂载点（崩溃/强杀后的真实场景）
