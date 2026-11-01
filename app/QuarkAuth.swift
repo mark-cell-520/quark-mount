@@ -59,6 +59,14 @@ final class QuarkAuth {
         return await validate(c)
     }
 
+    /// 不走共享 URLCache 的会话：校验/存储列表这类必须新鲜的 GET。
+    /// 注意：扫码流程依赖 HTTPCookieStorage.shared 收集 cookie，那些请求必须继续用 .shared
+    private static let fresh: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 15
+        return URLSession(configuration: c)
+    }()
+
     private static func readCookie() -> String? {
         guard let c = try? String(contentsOf: Installer.cookieFile, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines), !c.isEmpty else { return nil }
@@ -74,6 +82,7 @@ final class QuarkAuth {
             throw InstallError(message: "二维码接口地址错误")
         }
         var req = URLRequest(url: tokenURL)
+        req.timeoutInterval = 15
         req.setValue(ua, forHTTPHeaderField: "User-Agent")
         req.setValue("https://pan.quark.cn/", forHTTPHeaderField: "Referer")
         let (td, _) = try await URLSession.shared.data(for: req)
@@ -141,8 +150,12 @@ final class QuarkAuth {
             throw InstallError(message: "登录接口地址错误")
         }
         var ireq = URLRequest(url: infoURL)
+        ireq.timeoutInterval = 15
         ireq.setValue(ua, forHTTPHeaderField: "User-Agent")
-        let (_, _) = try await URLSession.shared.data(for: ireq)
+        let (_, iresp) = try await URLSession.shared.data(for: ireq)
+        if let code = (iresp as? HTTPURLResponse)?.statusCode, code >= 400 {
+            throw InstallError(message: "登录失败：夸克账号接口返回 HTTP \(code)，请重试")
+        }
         var cookie = collectQuarkCookies()
         guard !cookie.isEmpty else {
             throw InstallError(message: "登录失败：未获取到 cookie")
@@ -153,6 +166,7 @@ final class QuarkAuth {
         for attempt in 0..<2 {
             if let cfgURL = URL(string: "https://drive-pc.quark.cn/1/clouddrive/config?pr=ucpro&fr=pc&uc_param_str=") {
                 var creq = URLRequest(url: cfgURL)
+                creq.timeoutInterval = 15
                 creq.setValue(ua, forHTTPHeaderField: "User-Agent")
                 creq.setValue("https://pan.quark.cn", forHTTPHeaderField: "Referer")
                 creq.setValue(cookie, forHTTPHeaderField: "Cookie")
@@ -186,8 +200,8 @@ final class QuarkAuth {
         req.setValue(ua, forHTTPHeaderField: "User-Agent")
         req.setValue("https://pan.quark.cn", forHTTPHeaderField: "Referer")
         req.setValue(cookie, forHTTPHeaderField: "Cookie")
-        req.timeoutInterval = 15
-        guard let (d, _) = try? await URLSession.shared.data(for: req),
+        req.timeoutInterval = 10
+        guard let (d, _) = try? await fresh.data(for: req),
               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
             return .networkError      // 请求失败 = 网络问题，不是 cookie 失效
         }
@@ -237,11 +251,12 @@ final class QuarkAuth {
 
         func api(_ method: String, _ path: String, body: Any? = nil) async throws -> (Int, [String: Any]) {
             var req = URLRequest(url: URL(string: "http://127.0.0.1:\(Installer.port)\(path)")!)
+            req.timeoutInterval = 10
             req.httpMethod = method
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue(token, forHTTPHeaderField: "Authorization")
             if let b = body { req.httpBody = try JSONSerialization.data(withJSONObject: b) }
-            let (d, resp) = try await URLSession.shared.data(for: req)
+            let (d, resp) = try await fresh.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let j = (try? JSONSerialization.jsonObject(with: d) as? [String: Any]) ?? [:]
             return (code, j)
@@ -258,21 +273,35 @@ final class QuarkAuth {
         let additionStr = (try? JSONSerialization.data(withJSONObject: addition))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
 
-        // 找已有的 Quark 存储
+        // 找已有的 Quark 存储：按挂载路径精确匹配（历史遗留多个 Quark 存储时不能乱更新）
         let (_, list) = try await api("GET", "/api/admin/storage/list")
         let existing = ((list["data"] as? [String: Any])?["content"] as? [[String: Any]] ?? [])
             .filter { ($0["driver"] as? String) == "Quark" }
+        let atMount = existing.filter { ($0["mount_path"] as? String) == "/quark" }
+        let targets = atMount.isEmpty ? existing : atMount
 
-        if let old = existing.first, let oldId = old["id"] as? Int {
+        if let old = targets.first, let oldId = old["id"] as? Int {
             // 优先原地更新（不删旧配置——删了建失败就没有退路）
             var body = old
             body["addition"] = additionStr
             let (ucode, uresp) = try await api("POST", "/api/admin/storage/update?id=\(oldId)", body: body)
             if ucode == 200, (uresp["code"] as? Int) == 200 {
+                // 其余同名存储也一并刷新，避免残留旧 cookie 造成路由不确定
+                for extra in targets.dropFirst() {
+                    if let eid = extra["id"] as? Int {
+                        var eb = extra
+                        eb["addition"] = additionStr
+                        _ = try? await api("POST", "/api/admin/storage/update?id=\(eid)", body: eb)
+                    }
+                }
                 state.log("夸克存储已更新（登录状态已刷新）")
                 return
             }
-            state.log("存储更新接口不可用（HTTP \(ucode)），改用删除重建…")
+            // 只有「接口真不存在」才降级删除重建；限频/超时/5xx 一律抛错，保住用户原配置
+            guard ucode == 404 || ucode == 405 else {
+                throw InstallError(message: "更新夸克存储失败（HTTP \(ucode)：\(uresp["message"] as? String ?? "未知")）。原配置未动，请稍后重试")
+            }
+            state.log("存储更新接口不存在（HTTP \(ucode)），降级删除重建…")
             let (dcode, dresp) = try await api("POST", "/api/admin/storage/delete?id=\(oldId)")
             guard dcode == 200, (dresp["code"] as? Int) == 200 else {
                 throw InstallError(message: "移除旧存储失败：\(dresp["message"] as? String ?? "HTTP \(dcode)")")

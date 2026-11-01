@@ -29,7 +29,7 @@
 
 ## 下载安装
 
-从 [Releases](../../releases) 下载 `QuarkMount-1.0.1.dmg`（或 `.zip`）：
+从 [Releases](../../releases) 下载 `QuarkMount-1.0.2.dmg`（或 `.zip`）：
 
 1. 双击 dmg，把「夸克网盘」拖进「应用程序」
 2. **首次打开：右键 App 图标 →「打开」→ 再点「打开」**（未购买 Apple 开发者签名，Gatekeeper 首次会拦，之后不再询问）

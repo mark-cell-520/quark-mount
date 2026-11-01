@@ -120,3 +120,22 @@
 - rclone/OpenList 为独立进程，通过本机 HTTP 通信，App 不链接其代码（许可证隔离，见 NOTICE.md）
 - amd64 架构的组件未锁定 SHA256（本机为 arm64，无法取得官方 amd64 包的校验和）——体积+归档+冒烟三重校验仍生效
 - macFUSE 的 pkg 安装路径（`installer -pkg` + 授权弹框）在已安装 macFUSE 的机器上无法完整重放，该段代码经人工审查 + dmg 挂载/解包链路实测
+
+## 第三轮审计修复（v1.0.2，并行子代理复审 + 性能专项）
+
+第三轮由两个并行只读子代理复审全量代码，叠加用户实测反馈（启动慢、打开文件卡、App 退出挂载没）。无 CRITICAL；修复 2 HIGH + 6 MEDIUM/LOW，并修复测试中新暴露的 2 个架构级缺陷：
+
+| 级别 | 发现 | 修复 |
+|---|---|---|
+| HIGH | **卸载不验证 bootout/unmount 结果就删数据目录**：失败被 `|| true` 吞掉 → 幽灵挂载 + 假「已卸载」 | 逐步验证（开机项/挂载各自确认），失败如实报告，不再静默 |
+| HIGH | **detect() 恢复路径无代际守卫**：用户中途点「开始部署」后，晚到的恢复结果会覆盖新部署状态 | 恢复块捕获 deployGeneration，代际变化即丢弃结果 |
+| HIGH（实测新发现） | **守护脚本的 rclone 前台运行堵住整个循环**：挂载活着时循环卡在 mount 命令里，服务健康检查永远跑不到 → App 退出带走 openlist 后无人复活 | 挂载改后台运行 + 循环内同时照看服务与挂载（杀 openlist 6s 复活、杀 rclone 6s 重挂，均实测） |
+| HIGH（实测新发现） | **runAll 先 mount 后 setupAutoStart**：全新部署时挂载落在 App 自己的 rclone 头上（App 退出会带走） | 调整步骤顺序：先装开机自启再挂载，挂载归 launchd |
+| MEDIUM | addStorage「先删后建」兜底在 429/超时/5xx 时也触发 → 可能删掉用户可用配置后建失败，网盘变空 | 仅 404/405（接口真不存在）才降级删除重建，其余抛错保住原配置 |
+| MEDIUM | networkError 只保护自动路径，手动点部署仍会卸载健康挂载 | runAll 开头加网络闸门：cookie 校验不通直接中止，不动现有挂载 |
+| MEDIUM | detect() 串行网络链，启动最坏 18s+ | 四项检测并行（async let）+ cookie 请求 10s 超时 |
+| MEDIUM | `pkill -x rclone` 误杀用户自己的 rclone 挂载 | 全部改精确匹配 `pkill -f 'Application Support/QuarkMount/rclone.conf'`（实测 daemonized rclone 保留完整 argv） |
+| MEDIUM | 守护脚本 `cd "$BASE" || exit 1` + KeepAlive = 数据目录缺失时崩溃循环 | 所有故障路径只 log + sleep，绝不 exit |
+| LOW | 存储列表未按挂载路径过滤，多 Quark 存储时更新错对象；URLSession.shared 缓存可能读到陈旧响应；curl 无断点续传；日志无自动滚动；版本号硬编码 | 按 mount_path 过滤并全量刷新；校验/列表改用 ephemeral 会话；curl 加 `-C -` 续传；日志自动滚到底 + 打开日志按钮；build.sh 注入 VERSION |
+
+**性能专项**（rclone 挂载参数重调，实测数据）：`--vfs-cache-mode full --cache-dir <支持目录>/vfs-cache --vfs-cache-max-size 20G --vfs-cache-min-free-space 5G`（读也进缓存）+ `--vfs-read-ahead 64M --buffer-size 32M --transfers/checkers 8` + `--timeout 30s --contimeout 10s --low-level-retries 3`（卡住最多 30s 失败）+ `--poll-interval 0 --vfs-cache-poll-interval 5m --no-checksum`（砍后台请求）。实测：进目录 0.23s/缓存后 0.006s；大文件二次打开 0.007s（原需重新走网络）；20MB 写入 0.044s 秒回；常驻 RSS 无回归（rclone 59M / openlist 74M）。安装流程并行化：部署开始即并行下载全部缺失组件，全新部署从 ~7 分钟降到 ~4 分钟，且修复了 detect 在无 plist 时傻等 60s 才进部署的问题（启动到下载开始 80s → 8s）。

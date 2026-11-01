@@ -151,24 +151,31 @@ struct ContentView: View {
     }
 
     private var logView: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 3) {
-                ForEach(state.logs) { e in
-                    HStack(alignment: .top, spacing: 6) {
-                        Text(e.time)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(.secondary)
-                        Text(e.text)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(e.text.contains("失败") || e.text.contains("错误") ? .red : .primary)
-                            .fixedSize(horizontal: false, vertical: true)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 3) {
+                    ForEach(state.logs) { e in
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(e.time)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(.secondary)
+                            Text(e.text)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(e.text.contains("失败") || e.text.contains("错误") ? .red : .primary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .id(e.id)
                     }
                 }
+                .padding(10)
             }
-            .padding(10)
+            // 新日志自动滚到底（长部署过程不用手动拉）
+            .onChange(of: state.logs.count) { _ in
+                if let last = state.logs.last { proxy.scrollTo(last.id, anchor: .bottom) }
+            }
+            .background(Color(nsColor: .textBackgroundColor).opacity(0.6))
+            .cornerRadius(8)
         }
-        .background(Color(nsColor: .textBackgroundColor).opacity(0.6))
-        .cornerRadius(8)
     }
 
     private var qrView: some View {
@@ -220,6 +227,7 @@ struct ContentView: View {
                 Button("打开网盘") { state.openFinder() }
                 Button("重新挂载") { state.remount() }
                     .disabled(state.remountTask != nil)
+                Button("打开日志") { state.openLogs() }
                 Button("重新扫码") { state.rescan() }
                 Button("卸载", role: .destructive) { state.uninstall() }
             }

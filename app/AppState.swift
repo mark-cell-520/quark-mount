@@ -85,7 +85,7 @@ final class AppState: ObservableObject {
             }
         }
         // daemon 化后 argv 只剩 "rclone"，按进程名精确杀（-f 模式匹配不到）
-        _ = await Installer.shAsync("pkill -x rclone 2>/dev/null || true")
+        _ = await Installer.shAsync("pkill -f 'Application Support/QuarkMount/rclone.conf' 2>/dev/null || true")
         // 停掉非本应用的 openlist（旧版手动部署），保留本应用的
         _ = await Installer.shAsync("""
             for p in $(pgrep -f 'openlist server' 2>/dev/null); do
@@ -108,11 +108,17 @@ final class AppState: ObservableObject {
         let s = AppState.shared
         // 检测期间状态被别处改动（用户点了开始/另一窗口）则放弃本次结果
         guard s.phase == .checking else { return }
-        s.macfuseReady = await Installer.isMacFuseReady()
-        s.mountOK = await Installer.isMountedAsync()
-        let cookieState = await QuarkAuth.hasValidCookie()
+        // 四项检测并行（cookie 校验是网络请求，慢时不能拖累本地项；启动更快）
+        async let macfuseR = Installer.isMacFuseReady()
+        async let mountR = Installer.isMountedAsync()
+        async let cookieR = QuarkAuth.hasValidCookie()
+        async let svcR = Installer.serviceRunning()
+        let (mf, mo, ck, sv) = await (macfuseR, mountR, cookieR, svcR)
+        s.macfuseReady = mf
+        s.mountOK = mo
+        let cookieState = ck
         s.cookieValid = (cookieState == .valid)
-        let svc = await Installer.serviceRunning()
+        let svc = sv
         s.deployed = s.mountOK && svc && s.cookieValid
         guard s.phase == .checking else { return }
         if cookieState == .networkError {
@@ -126,22 +132,27 @@ final class AppState: ObservableObject {
         // 未部署则自动开始（一键体验：打开即用）
         if !s.deployed {
             // 轻量恢复：登录还有效、只是挂载/服务没上（开机竞态、守护被杀）→ 唤醒守护进程即可，
-            // 不必重新部署（takeover 会卸载正常挂载，代价大）
-            if s.cookieValid {
+            // 不必重新部署（takeover 会卸载正常挂载，代价大）。
+            // 前提是「曾经部署过」（plist 存在）——全新安装直接走部署，不能在这儿等
+            if s.cookieValid, Installer.agentPlistExists {
+                let gen = s.deployGeneration   // 等待期间用户可能点了「开始部署」（代际+1）
                 s.log("挂载未就绪但登录有效，尝试唤醒后台守护进程…")
                 await Installer.ensureAgentRunning(state: s)
                 var recovered = false
                 for _ in 0..<60 {
+                    // 用户开始了新部署 → 丢弃本次恢复结果，别踩新任务的状态
+                    guard gen == s.deployGeneration, s.phase == .idle else { return }
                     if await Installer.isMountedAsync(), await Installer.serviceRunning() {
                         recovered = true
                         break
                     }
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
+                guard gen == s.deployGeneration else { return }
                 if recovered {
                     s.mountOK = true
                     s.deployed = true
-                    s.phase = .finished
+                    s.phase = .idle        // 走 readyView 常驻就绪页（不是「部署完成」一次性页）
                     s.log("后台守护已恢复：挂载 ✅ 服务 ✅")
                     return
                 }
@@ -167,13 +178,30 @@ final class AppState: ObservableObject {
         // 只有「仍是当前代」才清理/改写状态，旧任务晚到的结果一律丢弃
         defer { if generation == deployGeneration { deployTask = nil } }
         do {
+            // 网络闸门：cookie 校验不通时绝不 takeover（那会卸载健康的挂载），直接中止
+            let cs = await QuarkAuth.hasValidCookie()
+            if cs == .networkError {
+                log("⚠️ 网络不通，无法验证登录状态，已中止（现有挂载未动）。请联网后重试")
+                phase = .idle
+                return
+            }
             await takeover()
+            // 磁盘预检（下载前就要拦：组件 ~143MB，另留日常余量）
+            let (freeOut, _) = await Installer.shAsync("df -m '$HOME/Library/Application Support' | awk 'NR==2{print $4}'")
+            if let freeMB = Int(freeOut.trimmingCharacters(in: .whitespacesAndNewlines)), freeMB < 400 {
+                throw InstallError(message: "磁盘空间不足（剩余 \(freeMB)MB，至少需要 400MB）")
+            }
+            // 并行预下载：macFUSE 安装需要管理员交互的这段时间里，组件已在后台下好
+            let prefetch = Installer.prefetchAssets(state: self)
+            let progressTask = prefetch.startProgress(state: self)
+            defer { prefetch.cancelAll(); progressTask.cancel() }
+
             enterStep(0)
-            try await Installer.ensureMacFUSE(state: self)
+            try await Installer.ensureMacFUSE(state: self, prefetch: prefetch)
             finishStep(0)
 
             enterStep(1)
-            try await Installer.deployComponents(state: self)
+            try await Installer.deployComponents(state: self, prefetch: prefetch)
             finishStep(1)
 
             enterStep(2)
@@ -184,12 +212,14 @@ final class AppState: ObservableObject {
             try await QuarkAuth.ensureCookie(state: self)   // 内部可能切到 .qr 相位
             finishStep(3)
 
+            // 顺序要紧：先装好开机自启（守护进程是挂载的持有者），再挂载——
+            // 否则全新部署时挂载落在 App 自己的 rclone 头上（App 退出/崩溃会带走它）
             enterStep(4)
-            try await Installer.mount(state: self)
+            try await Installer.setupAutoStart(state: self)
             finishStep(4)
 
             enterStep(5)
-            try await Installer.setupAutoStart(state: self)
+            try await Installer.mount(state: self)
             finishStep(5)
 
             phase = .finished
@@ -214,6 +244,11 @@ final class AppState: ObservableObject {
     func openFinder() {
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: Installer.mountPoint.path)
         NSWorkspace.shared.open(Installer.mountPoint)
+    }
+
+    func openLogs() {
+        NSWorkspace.shared.selectFile(Installer.base.appendingPathComponent("mount.log").path, inFileViewerRootedAtPath: Installer.base.path)
+        NSWorkspace.shared.open(Installer.base)
     }
 
     func openSecuritySettings() {

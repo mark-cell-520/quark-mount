@@ -24,6 +24,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp QuarkMount "$APP/Contents/MacOS/"
 cp AppIcon.icns "$APP/Contents/Resources/"
 cp app/Info.plist "$APP/Contents/"
+plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"   # 版本号以 VERSION 文件为准
 
 echo "==> ad-hoc 签名（未买开发者证书时本机/分发可用；Gatekeeper 首次需右键打开）"
 codesign --force --sign - "$APP"
