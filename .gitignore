@@ -21,3 +21,4 @@ AppIcon.icns
 
 # 日志与运行时数据
 *.log
+.git-commit-msg.txt
