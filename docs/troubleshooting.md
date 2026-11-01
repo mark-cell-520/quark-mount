@@ -15,13 +15,22 @@ tail -20 ~/Library/Application\ Support/QuarkMount/mount.log
 
 出现 `context deadline exceeded` 是夸克 API 慢，会自动重试，属正常。
 
-### 报错 `Resource busy` / `mount stopped before calling Init`
+### `~/Quark` 报「Device not configured」/ 文件夹图标在但打不开
 
-**原因 A（最常见）**：有残留的 rclone 守护进程占着挂载目录。检查：
+**原因**：rclone 进程被强杀或崩溃后，macFUSE 挂载条目残留成「僵尸」——文件夹还在，文件系统已死，任何操作都报错。
+**处理**：v1.1.0 起守护进程会自动识别（挂载条目 + rclone 进程双条件健康检查）并恢复，通常 10 秒内自愈。想手动处理：
 
 ```bash
-pgrep -x rclone        # 有输出即有残留
-pkill -x rclone        # 清理后重试
+diskutil unmount force ~/Quark     # 清掉残留条目，守护进程随后自动重挂
+```
+
+### 报错 `Resource busy` / `mount stopped before calling Init`
+
+**原因 A（最常见）**：有残留的 rclone 守护进程占着挂载目录。检查（**精确匹配本应用的配置**——`pkill -x rclone` 会连用户自己的 rclone 挂载一起杀，别用）：
+
+```bash
+pgrep -fl 'Application Support/QuarkMount/rclone.conf'        # 有输出即有残留
+pkill -f 'Application Support/QuarkMount/rclone.conf'        # 清理后重试
 ```
 
 **原因 B**：挂载点目录被卡死的进程持有（异常强卸载导致）。处理：

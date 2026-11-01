@@ -169,8 +169,9 @@ struct ContentView: View {
                 }
                 .padding(10)
             }
-            // 新日志自动滚到底（长部署过程不用手动拉）
-            .onChange(of: state.logs.count) { _ in
+            // 新日志自动滚到底（长部署过程不用手动拉）。
+            // 用 last?.id 而不是 count——logs 满 300 条后 count 不再变化，onChange 失效（v1.0.2 缺陷）
+            .onChange(of: state.logs.last?.id) { _ in
                 if let last = state.logs.last { proxy.scrollTo(last.id, anchor: .bottom) }
             }
             .background(Color(nsColor: .textBackgroundColor).opacity(0.6))
@@ -192,14 +193,22 @@ struct ContentView: View {
                         .interpolation(.none)
                         .resizable()
                         .frame(width: 210, height: 210)
+                        .accessibilityLabel("登录二维码")
                 } else {
                     ProgressView()
+                        .accessibilityLabel("正在获取二维码")
                 }
             }
             Text(state.qrHint)
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
+            // 倒计时展示（v1.0.2 的 qrCountdown 是没有任何视图读取的死状态）
+            if state.qrCountdown > 0 {
+                Text("二维码 \(state.qrCountdown) 秒后过期")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
             HStack(spacing: 10) {
                 Button("重新获取二维码") { state.rescan() }
                     .disabled(state.phase != .qr)
@@ -217,6 +226,7 @@ struct ContentView: View {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 52))
                 .foregroundColor(.green)
+                .accessibilityHidden(true)
             Text("一切就绪")
                 .font(.system(size: 17, weight: .semibold))
             Text("夸克网盘已挂载在 ~/Quark\n后台守护持有：退出 App 不影响，开机自动挂载，掉线自动恢复")
@@ -228,8 +238,11 @@ struct ContentView: View {
                 Button("重新挂载") { state.remount() }
                     .disabled(state.remountTask != nil)
                 Button("打开日志") { state.openLogs() }
-                Button("重新扫码") { state.rescan() }
+                // 已就绪的「重新扫码」= 轻量刷新登录（v1.0.2 会整包重部署+拆挂载）
+                Button("重新扫码") { state.refreshLogin() }
+                    .disabled(state.refreshTask != nil)
                 Button("卸载", role: .destructive) { state.uninstall() }
+                    .disabled(state.uninstalling)
             }
         }
         .padding(20)
@@ -241,14 +254,23 @@ struct ContentView: View {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 52))
                 .foregroundColor(.green)
+                .accessibilityHidden(true)
             Text("部署完成")
                 .font(.system(size: 17, weight: .semibold))
             Text("夸克网盘已挂载在 ~/Quark，Finder 左侧可直接访问\n开机自动挂载，掉线自动恢复")
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
-            Button("打开网盘") { state.openFinder() }
-                .controlSize(.large)
+            // v1.0.2 此页只有「打开网盘」，卸载/重扫只能关窗重开——补齐管理入口
+            HStack(spacing: 10) {
+                Button("打开网盘") { state.openFinder() }
+                    .controlSize(.large)
+                Button("打开日志") { state.openLogs() }
+                Button("重新扫码") { state.refreshLogin() }
+                    .disabled(state.refreshTask != nil)
+                Button("卸载", role: .destructive) { state.uninstall() }
+                    .disabled(state.uninstalling)
+            }
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -289,9 +311,18 @@ struct ContentView: View {
                 .foregroundColor(.secondary.opacity(0.7))
             switch state.phase {
             case .idle, .failed:
-                Button(state.deployed ? "重新部署" : "开始部署") { state.startDeploy() }
-                    .controlSize(.large)
-                    .keyboardShortcut(.defaultAction)
+                if state.deployed {
+                    // 已就绪时「重新部署」会卸载健康挂载：去掉 Return 默认键 + 二次确认
+                    // （v1.0.2 误按回车就拆盘，无确认）
+                    Button("重新部署") { confirmRedeploy() }
+                        .controlSize(.large)
+                        .disabled(state.uninstalling)
+                } else {
+                    Button("开始部署") { state.startDeploy() }
+                        .controlSize(.large)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(state.uninstalling)
+                }
             case .checking:
                 Button("开始部署") { state.startDeploy() }.disabled(true)
             case .running:
@@ -299,7 +330,7 @@ struct ContentView: View {
             case .qr:
                 Button("等待扫码…") {}.disabled(true)
             case .finished:
-                Button("完成") { NSApplication.shared.keyWindow?.close() }
+                Button("完成") { closeWindow() }
                     .controlSize(.large)
             }
         }
@@ -313,6 +344,28 @@ struct ContentView: View {
         case .qr: return "等待扫码"
         default: return ""
         }
+    }
+
+    // MARK: 辅助
+
+    /// 重新部署确认：会卸载当前挂载并重走全流程
+    private func confirmRedeploy() {
+        let alert = NSAlert()
+        alert.messageText = "重新部署会卸载当前挂载"
+        alert.informativeText = "后台守护会重新拉起草挂载，正在上传/下载中的文件会中断，登录状态需要重新确认。确定继续吗？"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "重新部署")
+        alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn {
+            state.startDeploy()
+        }
+    }
+
+    /// 关闭窗口：keyWindow 在 App 失活时为 nil（v1.0.2 死按钮）——回退到可见窗口
+    private func closeWindow() {
+        if let w = NSApplication.shared.keyWindow { w.close(); return }
+        if let w = NSApplication.shared.windows.first(where: { $0.canBecomeKey && $0.isVisible }) { w.close(); return }
+        NSApplication.shared.windows.last?.close()
     }
 }
 

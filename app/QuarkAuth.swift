@@ -94,7 +94,10 @@ final class QuarkAuth {
 
         // 2. 二维码图片
         let qrText = "\(qrURLPrefix)?token=\(token)&client_id=532&ssb=weblogin&uc_param_str=&uc_biz_str=S%3Acustom%7COPT%3ASAREA%400%7COPT%3AIMMERSIVE%401%7COPT%3ABACK_BTN_STYLE%400"
-        state.qrImage = makeQR(qrText)
+        guard let qr = makeQR(qrText) else {
+            throw InstallError(message: "二维码生成失败，请重试")
+        }
+        state.qrImage = qr
         state.qrHint = "请用夸克 APP 扫描上方二维码，并在手机上确认登录"
         state.log("二维码已生成，等待扫码（3 分钟有效）")
 
@@ -191,6 +194,19 @@ final class QuarkAuth {
         return cookie
     }
 
+    // MARK: 轻量刷新登录（就绪页「重新扫码」用：不动挂载/组件/守护）
+
+    /// 扫码 → 换 cookie → 更新存储配置。phase 由调用方（AppState.refreshLogin）管理
+    static func refreshLogin(state: AppState) async throws {
+        let cookie = try await qrLogin(state: state)
+        try writeCookie(cookie)
+        state.log("登录成功，cookie 已保存")
+        try await addStorage(state: state)
+        state.cookieValid = true
+        let svc = await Installer.serviceRunning()
+        state.deployed = state.mountOK && svc
+    }
+
     // MARK: cookie 工具
 
     /// 验证 cookie：valid=可用 / invalid=已失效 / networkError=网络不通（无法判断）
@@ -226,7 +242,8 @@ final class QuarkAuth {
     // MARK: 二维码图片（CoreImage，零依赖）
 
     static func makeQR(_ text: String) -> NSImage? {
-        guard let data = text.data(using: .ascii) else { return nil }
+        // utf8：ascii 会在 token/URL 含非 ASCII 时静默返回 nil，二维码区永久转圈无错误（v1.0.2 缺陷）
+        guard let data = text.data(using: .utf8) else { return nil }
         guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
         filter.setValue(data, forKey: "inputMessage")
         filter.setValue("M", forKey: "inputCorrectionLevel")
@@ -274,9 +291,14 @@ final class QuarkAuth {
             .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
 
         // 找已有的 Quark 存储：按挂载路径精确匹配（历史遗留多个 Quark 存储时不能乱更新）
-        let (_, list) = try await api("GET", "/api/admin/storage/list")
-        let existing = ((list["data"] as? [String: Any])?["content"] as? [[String: Any]] ?? [])
-            .filter { ($0["driver"] as? String) == "Quark" }
+        // list 的 HTTP 状态码必须校验：v1.0.2 丢弃状态码，5xx/错误体被当成空列表 →
+        // 静默走 create 分支建出重复存储（旧 cookie 残留，路由不确定）
+        let (lcode, list) = try await api("GET", "/api/admin/storage/list")
+        guard lcode == 200, (list["code"] as? Int) == 200,
+              let content = (list["data"] as? [String: Any])?["content"] as? [[String: Any]] else {
+            throw InstallError(message: "读取存储列表失败（HTTP \(lcode)），无法安全更新登录状态")
+        }
+        let existing = content.filter { ($0["driver"] as? String) == "Quark" }
         let atMount = existing.filter { ($0["mount_path"] as? String) == "/quark" }
         let targets = atMount.isEmpty ? existing : atMount
 

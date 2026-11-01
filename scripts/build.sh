@@ -3,7 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION="$(cat VERSION)"
+VERSION="$(cat VERSION | tr -d '[:space:]')"
+if [ -z "$VERSION" ]; then echo "错误：VERSION 文件为空" >&2; exit 1; fi
+case "$VERSION" in *" "*) echo "错误：VERSION 含空格：$VERSION" >&2; exit 1;; esac
 APP="夸克网盘.app"
 DIST="dist"
 SWIFT_FILES=(app/*.swift)
@@ -25,6 +27,7 @@ cp QuarkMount "$APP/Contents/MacOS/"
 cp AppIcon.icns "$APP/Contents/Resources/"
 cp app/Info.plist "$APP/Contents/"
 plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"   # 版本号以 VERSION 文件为准
+plutil -replace CFBundleVersion -string "$VERSION" "$APP/Contents/Info.plist"   # 与角标一致（v1.0.2 恒为模板 1.0.0，显示简介对不上）
 
 echo "==> ad-hoc 签名（未买开发者证书时本机/分发可用；Gatekeeper 首次需右键打开）"
 codesign --force --sign - "$APP"

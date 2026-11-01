@@ -43,15 +43,22 @@ final class AppState: ObservableObject {
     var deployTask: Task<Void, Never>?      // 进行中的部署任务（防重入）
     var deployGeneration = 0                // 部署代际：旧任务的结果不得改写新任务状态
     var remountTask: Task<Void, Never>?     // 重新挂载任务（进行中禁用按钮）
+    var refreshTask: Task<Void, Never>?     // 刷新登录任务（轻量扫码）
+    var uninstallTask: Task<Void, Never>?   // 卸载任务（忙态互斥）
+    @Published var uninstalling = false     // 卸载进行中：禁部署/重挂/检测，防并发互删
 
     static var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
     }
 
-    func log(_ s: String) {
+    private static let timeFmt: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
-        logs.append(LogEntry(time: f.string(from: Date()), text: s))
+        return f
+    }()
+
+    func log(_ s: String) {
+        logs.append(LogEntry(time: Self.timeFmt.string(from: Date()), text: s))
         if logs.count > 300 { logs.removeFirst(logs.count - 300) }
     }
 
@@ -86,20 +93,23 @@ final class AppState: ObservableObject {
         }
         // daemon 化后 argv 只剩 "rclone"，按进程名精确杀（-f 模式匹配不到）
         _ = await Installer.shAsync("pkill -f 'Application Support/QuarkMount/rclone.conf' 2>/dev/null || true")
-        // 停掉非本应用的 openlist（旧版手动部署），保留本应用的
-        _ = await Installer.shAsync("""
-            for p in $(pgrep -f 'openlist server' 2>/dev/null); do
-              if ! ps -p $p -o command= 2>/dev/null | grep -q 'Application Support/QuarkMount'; then kill $p 2>/dev/null; fi
-            done
-            """)
+        // 停掉非本应用的 openlist（旧版手动部署），保留本应用的——但只杀占着本应用端口(5244)的，
+        // 用户自用的其他 openlist 实例（不同数据目录/端口）不误杀（v1.0.2 无条件全杀）
+        if await Installer.shAsync("curl -s -o /dev/null --max-time 2 http://127.0.0.1:5244/").1 == 0 {
+            _ = await Installer.shAsync("""
+                for p in $(pgrep -f 'openlist server' 2>/dev/null); do
+                  if ! ps -p $p -o command= 2>/dev/null | grep -q 'Application Support/QuarkMount'; then kill $p 2>/dev/null; fi
+                done
+                """)
+        }
         try? await Task.sleep(nanoseconds: 1_000_000_000)
     }
 
     // MARK: 入口
 
     func checkExisting() {
-        // 防重入：部署中/扫码中不重复检测（多窗口 onAppear 会并发触发）
-        guard phase == .idle || phase == .checking || phase == .finished || phase == .failed else { return }
+        // 防重入：部署中/扫码中/卸载中不重复检测（多窗口 onAppear 会并发触发）
+        guard !uninstalling, phase == .idle || phase == .checking || phase == .finished || phase == .failed else { return }
         phase = .checking
         Task { await Self.detect() }
     }
@@ -109,24 +119,27 @@ final class AppState: ObservableObject {
         // 检测期间状态被别处改动（用户点了开始/另一窗口）则放弃本次结果
         guard s.phase == .checking else { return }
         // 四项检测并行（cookie 校验是网络请求，慢时不能拖累本地项；启动更快）
+        // 挂载用健康判定（条目 + rclone 进程）：僵尸条目不配算「已挂载」
         async let macfuseR = Installer.isMacFuseReady()
-        async let mountR = Installer.isMountedAsync()
+        async let mountR = Installer.isMountedHealthyAsync()
         async let cookieR = QuarkAuth.hasValidCookie()
         async let svcR = Installer.serviceRunning()
         let (mf, mo, ck, sv) = await (macfuseR, mountR, cookieR, svcR)
-        s.macfuseReady = mf
-        s.mountOK = mo
-        let cookieState = ck
-        s.cookieValid = (cookieState == .valid)
-        let svc = sv
-        s.deployed = s.mountOK && svc && s.cookieValid
         guard s.phase == .checking else { return }
+        let cookieState = ck
         if cookieState == .networkError {
-            // 网络抖动 ≠ 未部署：绝不能据此走自动部署（takeover 会卸载正常挂载）
+            // 网络抖动 ≠ 未部署：绝不能据此走自动部署（takeover 会卸载正常挂载）。
+            // 早退必须发生在改写 cookieValid/deployed 之前——否则一次网络抖动就把
+            // 就绪页静默降级成「开始部署」，诱导用户对健康挂载做重部署（v1.0.2 缺陷）
             s.phase = .idle
             s.log("⚠️ 登录状态检查失败（网络不通），已保留现状。请联网后重试")
             return
         }
+        s.macfuseReady = mf
+        s.mountOK = mo
+        s.cookieValid = (cookieState == .valid)
+        let svc = sv
+        s.deployed = s.mountOK && svc && s.cookieValid
         s.log("检测完成：macFUSE \(s.macfuseReady ? "就绪" : "未就绪")，服务 \(svc ? "运行中" : "未运行")，挂载 \(s.mountOK ? "正常" : "未挂载")，登录 \(s.cookieValid ? "有效" : "无效")")
         s.phase = .idle
         // 未部署则自动开始（一键体验：打开即用）
@@ -142,7 +155,7 @@ final class AppState: ObservableObject {
                 for _ in 0..<60 {
                     // 用户开始了新部署 → 丢弃本次恢复结果，别踩新任务的状态
                     guard gen == s.deployGeneration, s.phase == .idle else { return }
-                    if await Installer.isMountedAsync(), await Installer.serviceRunning() {
+                    if await Installer.isMountedHealthyAsync(), await Installer.serviceRunning() {
                         recovered = true
                         break
                     }
@@ -163,7 +176,7 @@ final class AppState: ObservableObject {
     }
 
     func startDeploy() {
-        guard phase == .idle || phase == .failed || phase == .qr else { return }
+        guard !uninstalling, phase == .idle || phase == .failed || phase == .qr else { return }
         // 取消旧任务（重新扫码场景）；用 generation 防止旧任务的 catch/defer 踩新任务的状态
         deployTask?.cancel()
         deployGeneration += 1
@@ -260,31 +273,82 @@ final class AppState: ObservableObject {
     func rescan() {
         qrImage = nil
         qrHint = ""
+        if deployed, phase == .idle {
+            // 已就绪时的「重新扫码」= 只刷新登录（换 cookie + 更新存储配置）。
+            // v1.0.2 会走整包重部署：卸载健康挂载、进度条归零、数秒后才重新出二维码（名不副实）
+            refreshLogin()
+            return
+        }
         // startDeploy 内部会取消旧任务并按新代际重启
         startDeploy()
     }
 
+    /// 轻量刷新登录：扫码 → 换 cookie → 更新存储配置。不动挂载/组件/守护进程
+    func refreshLogin() {
+        guard !uninstalling, phase == .idle, refreshTask == nil else { return }
+        phase = .qr
+        log("刷新登录：请用夸克 APP 扫描新二维码")
+        refreshTask = Task {
+            do {
+                try await QuarkAuth.refreshLogin(state: self)
+                log("✅ 登录状态已刷新（挂载未动）")
+            } catch {
+                if error is CancellationError {
+                    log("已取消刷新登录")
+                } else {
+                    let msg = (error as? InstallError)?.message ?? error.localizedDescription
+                    fatalError = msg
+                    log("刷新登录失败：\(msg)")
+                }
+            }
+            qrImage = nil
+            if phase == .qr { phase = .idle }
+            refreshTask = nil
+        }
+    }
+
     func uninstall() {
-        Task { await Installer.uninstall(state: self) }
+        // 忙态 + 互斥：卸载进行中（数秒无反馈窗口）禁止再触发部署/重挂/检测——
+        // v1.0.2 无此保护，用户连点「卸载」「重新部署」会并发互删对方刚建好的状态
+        guard !uninstalling else { return }
+        uninstalling = true
+        deployTask?.cancel()
+        remountTask?.cancel()
+        refreshTask?.cancel()
+        phase = .idle
+        log("开始卸载：停止服务 → 卸载挂载 → 移除开机项 → 删除数据…")
+        uninstallTask = Task { await Installer.uninstall(state: self) }
     }
 
     /// 重新挂载：唤醒后台守护进程等它挂（App 自己永不当挂载的主人）
     func remount() {
-        guard phase == .idle || phase == .finished else { return }
+        guard !uninstalling, phase == .idle || phase == .finished else { return }
         guard remountTask == nil else { return }
         log("正在重新挂载（唤醒后台守护进程）…")
         remountTask = Task {
             await Installer.ensureAgentRunning(state: self)
             var ok = false
             for _ in 0..<60 {
-                if await Installer.isMountedAsync() { ok = true; break }
+                // 健康判定（条目 + 进程）：僵尸条目不算挂载成功
+                if await Installer.isMountedHealthyAsync() { ok = true; break }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
             if ok {
                 mountOK = true
-                deployed = await Installer.serviceRunning() && cookieValid
-                log("✅ 已重新挂载到 ~/Quark（后台守护持有，退出 App 不影响）")
+                // deployed 判定前重新校验 cookie——detect 时的 cookieValid 可能是数小时前的陈旧值
+                let cs = await QuarkAuth.hasValidCookie()
+                if cs == .networkError {
+                    deployed = true   // 网络不通时保守保留，不误降级
+                    log("✅ 已重新挂载到 ~/Quark（登录状态检查不通，未改动）")
+                } else {
+                    cookieValid = (cs == .valid)
+                    deployed = await Installer.serviceRunning() && cookieValid
+                    log("✅ 已重新挂载到 ~/Quark（后台守护持有，退出 App 不影响）")
+                }
             } else {
+                // 失败必须清脏状态：否则界面停在「一切就绪」而 Finder 打不开（v1.0.2 缺陷）
+                mountOK = false
+                deployed = false
                 log("❌ 重新挂载失败。请查看 ~/Library/Application Support/QuarkMount/start-all.log")
             }
             remountTask = nil

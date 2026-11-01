@@ -44,10 +44,14 @@ final class Installer {
     static func assetFor(_ key: String) -> Asset? {
         guard var a = assets[key] else { return nil }
         if arch == "amd64" {
-            a = Asset(name: a.name.replacingOccurrences(of: "arm64", with: "amd64"),
-                      repo: a.repo, tag: a.tag, expectMB: a.expectMB, sha256: "")
-            // amd64 的校验和见 assetsAmd64（未锁定版本不提供校验，退化为体积+解压测试）
-            if let a2 = assetsAmd64[key] { a = a2 }
+            if let a2 = assetsAmd64[key] {
+                a = a2   // amd64 变体（openlist/rclone，官方哈希已锁定）
+            } else {
+                // 无 amd64 变体的组件（macFUSE dmg 与架构无关）——必须保留原资产的官方哈希，
+                // v1.0.2 在这里把 sha256 清空 → Intel 机三个组件全部零哈希校验（AUDIT HIGH-5）
+                a = Asset(name: a.name.replacingOccurrences(of: "arm64", with: "amd64"),
+                          repo: a.repo, tag: a.tag, expectMB: a.expectMB, sha256: a.sha256)
+            }
         }
         return a
     }
@@ -58,8 +62,8 @@ final class Installer {
         "macfuse":  Asset(name: "macfuse-5.5.0.dmg",             repo: "macfuse/macfuse",          tag: "macfuse-5.5.0", expectMB: 23, sha256: "92c21ef2db4199bcf5bddc8e6efb57b23ecb9715f74ab38cba2c77ab226d3830"),
     ]
     static let assetsAmd64: [String: Asset] = [
-        "openlist": Asset(name: "openlist-darwin-amd64.tar.gz", repo: "OpenListTeam/OpenList", tag: "v4.2.9", expectMB: 52, sha256: ""),
-        "rclone":   Asset(name: "rclone-v1.75.2-osx-amd64.zip",  repo: "rclone/rclone",           tag: "v1.75.2", expectMB: 34, sha256: ""),
+        "openlist": Asset(name: "openlist-darwin-amd64.tar.gz", repo: "OpenListTeam/OpenList", tag: "v4.2.9", expectMB: 52, sha256: "2822e7d63855deacc7b816171ca14aaae59fec97c955d7d4258eedbfe4b881"),
+        "rclone":   Asset(name: "rclone-v1.75.2-osx-amd64.zip",  repo: "rclone/rclone",           tag: "v1.75.2", expectMB: 34, sha256: "574e1f31cf1c464e5fb0325cb66fcbdeaf1efa1802bd9b17f13c256fd74b6561"),
     ]
     static let mirrors = ["https://gh-proxy.com/", "https://ghfast.top/", ""]
 
@@ -75,9 +79,18 @@ final class Installer {
         p.arguments = ["-c", cmd]
         p.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin"]
         do { try p.run() } catch { return ("", -1) }
+        // 必须先读管道再等退出：子进程输出超过 64KB 内核缓冲会阻塞在写端永不退出，
+        // 先 waitUntilExit 再读 = 永久挂起（主线程调用即 UI 冻死）
+        var data = Data()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
         p.waitUntilExit()
-        let d = pipe.fileHandleForReading.readDataToEndOfFile()
-        return (String(decoding: d, as: UTF8.self), p.terminationStatus)
+        _ = group.wait(timeout: .now() + 30)
+        return (String(decoding: data, as: UTF8.self), p.terminationStatus)
     }
 
     /// 异步执行 shell（不阻塞 UI 线程）
@@ -155,11 +168,24 @@ final class Installer {
             if let pre = try? await prefetch?.result(a.name) { dmg = pre }
             else { dmg = try await download(a, state: state) }
             state.log("挂载 dmg…")
+            // 快照对比定位本次挂载的卷：glob + head -1 会选到陈旧 macFUSE 卷（用旧 pkg 重装旧版），
+            // attach 后卷尚未出现时又会把竞态误报成「包损坏」
+            let before = Set((try? fm.contentsOfDirectory(atPath: "/Volumes")) ?? [])
             let (_, code) = await shAsync("hdiutil attach -nobrowse -quiet '\(dmg.path)'")
             guard code == 0 else { throw InstallError(message: "dmg 挂载失败") }
-            // 找到 pkg
-            let vol = await shAsync("ls -d /Volumes/*[Mm]ac[Ff]use* 2>/dev/null | head -1").0
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var vol = ""
+            for _ in 0..<10 {
+                let now = (try? fm.contentsOfDirectory(atPath: "/Volumes")) ?? []
+                if let v = now.first(where: { !before.contains($0) && $0.lowercased().contains("macfuse") }) {
+                    vol = "/Volumes/\(v)"
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+            guard !vol.isEmpty else {
+                _ = await shAsync("hdiutil detach -quiet '\(dmg.path)' 2>/dev/null")
+                throw InstallError(message: "dmg 挂载后未找到卷（安装包可能损坏，请重试）")
+            }
             let pkg = await shAsync("find '\(vol)' -maxdepth 2 -name '*.pkg' 2>/dev/null | head -1").0
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !pkg.isEmpty else {
@@ -211,8 +237,9 @@ final class Installer {
         mkdirs(dataDir)
         mkdirs(mountPoint)
 
-        // 预检：磁盘空间（组件 ~110MB + VFS 写缓存上限 10G 之外的日常占用，留 400MB 余量）
-        let (freeOut, _) = await shAsync("df -m '$HOME/Library/Application Support' | awk 'NR==2{print $4}'")
+        // 预检：磁盘空间（组件 ~110MB + VFS 写缓存上限之外的日常占用，留 400MB 余量）
+        // 注意：路径必须内联展开——单引号里的 $HOME 不会展开，df 直接报错，闸门永远是死代码（v1.0.2 实测）
+        let (freeOut, _) = await shAsync("df -m \"\(home.path)/Library/Application Support\" | awk 'NR==2{print $4}'")
         if let freeMB = Int(freeOut.trimmingCharacters(in: .whitespacesAndNewlines)), freeMB < 400 {
             throw InstallError(message: "磁盘空间不足（剩余 \(freeMB)MB，至少需要 400MB）")
         }
@@ -277,6 +304,16 @@ final class Installer {
             throw InstallError(message: "rclone 二进制无法运行，已清理。请重新部署")
         }
         state.log("组件就绪：OpenList + rclone（\(arch)）")
+        // 清理下载缓存：安装包解压/导入后即无用，v1.0.2 实测残留 82MB 常驻（资源占用）
+        let dlDir = base.appendingPathComponent("downloads")
+        if let files = try? fm.contentsOfDirectory(at: dlDir, includingPropertiesForKeys: nil) {
+            var freed = 0
+            for f in files {
+                let sz = (try? fm.attributesOfItem(atPath: f.path)[.size] as? UInt64) ?? 0
+                if (try? fm.removeItem(at: f)) != nil { freed += Int(sz) }
+            }
+            if freed > 0 { state.log("已清理安装包缓存（释放 \(freed / 1_048_576)MB）") }
+        }
     }
 
     // MARK: 下载（多镜像 + 进度 + 完整性校验）
@@ -286,7 +323,12 @@ final class Installer {
         let tmp = base.appendingPathComponent("downloads")
         mkdirs(tmp)
         let dest = tmp.appendingPathComponent(a.name)
-        try? fm.removeItem(at: dest)
+        // 分片策略：接近下完的视为可疑整文件删掉，未下完的保留供断点续传
+        // （v1.0.2 无脑 removeItem → 52MB 包断线即从零重下，AUDIT 声称的 -C - 实际不存在）
+        if let sz = try? fm.attributesOfItem(atPath: dest.path)[.size] as? UInt64,
+           Double(sz) >= a.expectMB * 1_048_576 * 0.95 {
+            try? fm.removeItem(at: dest)
+        }
         let expected = a.expectMB * 1_048_576
         var lastErr = "未知错误"
 
@@ -296,7 +338,7 @@ final class Installer {
                 state.progressLabel = "下载 \(a.name)（源\(i + 1)/\(mirrors.count)）"
                 state.progress = 0
             }
-            guard await curl(url: url, dest: dest, expected: expected, state: state, quiet: quiet) else {
+            guard await curl(url: url, dest: dest, expected: expected, state: state, quiet: quiet, resume: true) else {
                 lastErr = "下载中断"
                 state.log("镜像 \(i + 1) 下载失败，尝试下一个…")
                 continue
@@ -315,6 +357,7 @@ final class Installer {
                 if code != 0 || got != a.sha256.lowercased() {
                     lastErr = "SHA256 校验失败"
                     state.log("⚠️ 镜像 \(i + 1) 文件校验和不匹配（可能被篡改或损坏），已拒绝并切换源")
+                    try? fm.removeItem(at: dest)   // 毒文件绝不能给下一镜像续传
                     continue
                 }
                 state.log("SHA256 校验通过 ✅")
@@ -328,12 +371,13 @@ final class Installer {
             if await shAsync(testCmd).1 != 0 {
                 lastErr = "归档损坏"
                 state.log("镜像 \(i + 1) 的归档损坏，尝试下一个…")
+                try? fm.removeItem(at: dest)   // 坏包同样不能续传
                 continue
             }
             if !quiet { state.progress = 1 }
             return dest
         }
-        try? fm.removeItem(at: dest)
+        // 全镜像失败：保留分片（下次重试可续传），整文件可疑已在上面删过
         throw InstallError(message: "组件下载失败：\(a.name)（\(lastErr)。请检查网络后重试）")
     }
 
@@ -417,29 +461,41 @@ final class Installer {
         return Prefetch(tasks: tasks, names: names, expects: expects, totalExpected: total, tmpDir: tmp)
     }
 
-    private static func curl(url: String, dest: URL, expected: Double, state: AppState, quiet: Bool = false) async -> Bool {
-        await withCheckedContinuation { cont in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-                p.arguments = ["-sL", "--fail", "--connect-timeout", "15", "--max-time", "900",
-                               "-o", dest.path, url]
-                p.standardOutput = FileHandle.nullDevice
-                p.standardError = FileHandle.nullDevice
-                p.terminationHandler = { _ in cont.resume(returning: p.terminationStatus == 0) }
-                do { try p.run() } catch { cont.resume(returning: false); return }
-                // 进度轮询
-                Task.detached {
-                    while true {
-                        let sz = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size] as? UInt64) ?? 0
-                        let frac = min(1, Double(sz) / max(expected, 1))
-                        if !quiet { await MainActor.run { state.progress = frac } }
-                        try? await Task.sleep(nanoseconds: 500_000_000)
-                        if !p.isRunning { break }
+    private static func curl(url: String, dest: URL, expected: Double, state: AppState, quiet: Bool = false, resume: Bool = false) async -> Bool {
+        // 进程句柄盒：取消时能 terminate 掉 curl（v1.0.2 取消部署后 curl 仍在后台下满 15 分钟）
+        final class Box { var p: Process?; func terminate() { p?.terminate() } }
+        let box = Box()
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { cont in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+                    var args = ["-sL", "--fail", "--connect-timeout", "15", "--max-time", "900"]
+                    // 断点续传：分片存在且未下完时 -C -（v1.0.2 声称已加实际没有；换镜像同文件字节序一致，SHA256 兜底）
+                    if resume, let sz = try? fm.attributesOfItem(atPath: dest.path)[.size] as? UInt64,
+                       sz > 0, Double(sz) < expected * 0.95 {
+                        args += ["-C", "-"]
+                    }
+                    args += ["-o", dest.path, url]
+                    p.arguments = args
+                    p.standardOutput = FileHandle.nullDevice
+                    p.standardError = FileHandle.nullDevice
+                    p.terminationHandler = { _ in cont.resume(returning: p.terminationStatus == 0) }
+                    box.p = p
+                    do { try p.run() } catch { cont.resume(returning: false); return }
+                    // 进度轮询
+                    Task.detached {
+                        while true {
+                            let sz = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size] as? UInt64) ?? 0
+                            let frac = min(1, Double(sz) / max(expected, 1))
+                            if !quiet { await MainActor.run { state.progress = frac } }
+                            try? await Task.sleep(nanoseconds: 500_000_000)
+                            if !p.isRunning { break }
+                        }
                     }
                 }
             }
-        }
+        }, onCancel: { box.terminate() })
     }
 
     // MARK: Step 2: 启动服务 + 账号权限
@@ -449,33 +505,85 @@ final class Installer {
         await shAsync("curl -s --fail -o /dev/null --max-time 3 http://127.0.0.1:\(port)/").1 == 0
     }
 
+    /// 启动 OpenList 子进程（持有 Process 引用防释放；FileHandle 不能 close——run() 时要 dup 这个 fd）
+    static func launchOpenList(pass: String) throws {
+        let p = Process()
+        p.executableURL = openlistBin
+        p.arguments = ["server"]
+        p.currentDirectoryURL = base
+        p.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                         "OPENLIST_ADMIN_PASSWORD": pass]
+        let logURL = base.appendingPathComponent("openlist.log")
+        if !fm.fileExists(atPath: logURL.path) {
+            fm.createFile(atPath: logURL.path, contents: Data())
+        }
+        if let h = try? FileHandle(forWritingTo: logURL) {
+            try? h.seekToEnd()
+            p.standardOutput = h
+            p.standardError = h
+        }
+        try p.run()
+        Installer.retainedProcess = p
+    }
+
+    /// 轮询等待服务端口就绪（默认 30s）
+    static func waitForService(_ seconds: Int = 30) async -> Bool {
+        for _ in 0..<seconds {
+            if await serviceRunning() { return true }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return false
+    }
+
     static func startService(state: AppState) async throws {
-        // 停掉非本应用的 openlist（旧版手动部署），保留本应用的（pgrep 精确匹配，不用 lsof——本机 lsof 极慢）
-        _ = await shAsync("""
-            for p in $(pgrep -f 'openlist server' 2>/dev/null); do
-              if ! ps -p $p -o command= 2>/dev/null | grep -q 'Application Support/QuarkMount'; then kill $p 2>/dev/null; fi
-            done
-            """)
+        // 只清理「占着本应用端口(5244)的非本应用 openlist」——用户自用的其他 openlist 实例
+        // （不同数据目录/端口）不误杀（v1.0.2 无条件杀全部 'openlist server'，误杀面大且无提示）
+        if await shAsync("curl -s -o /dev/null --max-time 2 http://127.0.0.1:\(port)/").1 == 0 {
+            let killed = await shAsync("""
+                for p in $(pgrep -f 'openlist server' 2>/dev/null); do
+                  if ! ps -p $p -o command= 2>/dev/null | grep -q 'Application Support/QuarkMount'; then kill $p 2>/dev/null; echo $p; fi
+                done
+                """)
+            if !killed.0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                state.log("端口 \(port) 被其他 OpenList 实例占用，已停止（pid \(killed.0.trimmingCharacters(in: .whitespacesAndNewlines))）")
+            }
+        }
         try await Task.sleep(nanoseconds: 1_500_000_000)
 
-        // 写配置（仅本机监听 + 绝对路径）
+        // 写配置（仅本机监听 + 绝对路径）——每次启动都检查并纠正，不是「仅不存在才写」：
+        // 旧版静默失败落盘的 0.0.0.0 配置、用户手动跑过的 openlist 都会让管理界面暴露到局域网
         let conf = dataDir.appendingPathComponent("config.json")
-        if !fm.fileExists(atPath: conf.path) {
-            let json = """
-            {
-              "scheme": { "address": "127.0.0.1", "http_port": 5244, "https_port": -1, "force_https": false },
-              "database": { "type": "sqlite3", "db_file": "\(dataDir.path)/data.db", "table_prefix": "x_" },
-              "log": { "enable": true, "name": "\(dataDir.path)/log.log", "max_size": 20 },
-              "temp_dir": "\(dataDir.path)/temp",
-              "bleve_dir": "\(dataDir.path)/bleve",
-              "token_expires_in": 48
-            }
-            """
+        let json = """
+        {
+          "scheme": { "address": "127.0.0.1", "http_port": 5244, "https_port": -1, "force_https": false },
+          "database": { "type": "sqlite3", "db_file": "\(dataDir.path)/data.db", "table_prefix": "x_" },
+          "log": { "enable": true, "name": "\(dataDir.path)/log.log", "max_size": 20 },
+          "temp_dir": "\(dataDir.path)/temp",
+          "bleve_dir": "\(dataDir.path)/bleve",
+          "token_expires_in": 48
+        }
+        """
+        var configCorrected = false
+        let configOK: Bool = {
+            guard let existing = try? String(contentsOf: conf, encoding: .utf8),
+                  let ed = existing.data(using: .utf8),
+                  let ej = try? JSONSerialization.jsonObject(with: ed) as? [String: Any],
+                  let scheme = ej["scheme"] as? [String: Any] else { return false }
+            return (scheme["address"] as? String) == "127.0.0.1" && (scheme["http_port"] as? Int) == port
+        }()
+        if !configOK {
             do {
                 try json.write(to: conf, atomically: true, encoding: .utf8)
+                configCorrected = true
             } catch {
                 throw InstallError(message: "配置文件写入失败：\(error.localizedDescription)")
             }
+        }
+        // 配置刚被纠正而服务正在跑（旧配置生效中）→ 重启服务让 127.0.0.1 绑定生效
+        if configCorrected, await serviceRunning() {
+            state.log("检测到不安全的监听配置，已纠正为 127.0.0.1 并重启服务")
+            _ = await shAsync("pkill -f 'Application Support/QuarkMount/bin/openlist' 2>/dev/null")
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
         }
 
         // 启动（环境变量方式确保 admin 被创建）
@@ -499,35 +607,9 @@ final class Installer {
 
         if !(await serviceRunning()) {
             state.log("启动 OpenList 服务…")
-            let p = Process()
-            p.executableURL = openlistBin
-            p.arguments = ["server"]
-            p.currentDirectoryURL = base
-            p.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-                             "OPENLIST_ADMIN_PASSWORD": pass]
-            let logURL = base.appendingPathComponent("openlist.log")
-            if !fm.fileExists(atPath: logURL.path) {
-                fm.createFile(atPath: logURL.path, contents: Data())
-            }
-            if let h = try? FileHandle(forWritingTo: logURL) {
-                try? h.seekToEnd()
-                p.standardOutput = h
-                p.standardError = h
-                // 注意：不能 close——Process 启动时要 dup 这个 fd；Process 会强引用它
-            }
-            do {
-                try p.run()
-            } catch {
-                throw InstallError(message: "OpenList 启动失败：\(error.localizedDescription)")
-            }
-            Installer.retainedProcess = p   // 防止 Process 被提前释放
-            // 等待端口
-            var ok = false
-            for _ in 0..<30 {
-                try await Task.sleep(nanoseconds: 1_000_000_000)
-                if await serviceRunning() { ok = true; break }
-            }
-            guard ok else {
+            do { try launchOpenList(pass: pass) }
+            catch { throw InstallError(message: "OpenList 启动失败：\(error.localizedDescription)") }
+            guard await waitForService() else {
                 let (log, _) = await shAsync("tail -15 '\(base.appendingPathComponent("openlist.log").path)' 2>/dev/null")
                 throw InstallError(message: "OpenList 服务启动超时。\(log.prefix(300))")
             }
@@ -554,6 +636,19 @@ final class Installer {
             let code = (j["code"] as? Int) ?? (resp as? HTTPURLResponse)?.statusCode ?? 0
             if code == 429, attempt < 2 {
                 try await Task.sleep(nanoseconds: 8_000_000_000)   // 等 8 秒退避
+                continue
+            }
+            if (code == 401 || code == 403), attempt == 0 {
+                // 陈旧 openlist 占着端口（卸载半失败/App 被强杀后的孤儿进程）：.admin-pass 已是新密码，
+                // 旧实例不认 → 永远 401。杀掉用它自己的密码重启一次再试——否则用户卡死在 401
+                // 且没有任何可行动提示（v1.0.2 实测死路）
+                _ = await shAsync("pkill -f 'Application Support/QuarkMount/bin/openlist' 2>/dev/null")
+                for _ in 0..<5 {
+                    if await shAsync("curl -s -o /dev/null --max-time 2 http://127.0.0.1:\(port)/").1 != 0 { break }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+                try? launchOpenList(pass: pass)
+                _ = await waitForService()
                 continue
             }
             throw InstallError(message: "登录 OpenList 失败：\(j["message"] as? String ?? "code \(code)")")
@@ -618,9 +713,18 @@ final class Installer {
         await shAsync("mount | grep -q ' on \(mountPoint.path) '").1 == 0
     }
 
+    /// 健康挂载判定：挂载条目存在 **且** rclone 进程活着，两个条件缺一不可。
+    /// 只用 mount | grep 会被僵尸挂载骗过——rclone 被 kill -9/崩溃后 macFUSE 条目残留，
+    /// ls 报 Device not configured，而所有检查都显示「已挂载」（v1.0.2 稳定性实测复现，
+    /// 守护进程因此永不重挂）。守护脚本侧同逻辑修复。
+    static func isMountedHealthyAsync() async -> Bool {
+        guard await isMountedAsync() else { return false }
+        return await shAsync("pgrep -f 'Application Support/QuarkMount/rclone.conf'").1 == 0
+    }
+
     static func writeRcloneConf(state: AppState) async throws {
         let pass = (try? String(contentsOf: passFile, encoding: .utf8)) ?? ""
-        let (obscured, code) = await shAsync("'\(rcloneBin.path)' obscure '\(pass)'")
+        let (obscured, code) = await shAsync("'\(rcloneBin.path)' obscure '\(pass.replacingOccurrences(of: "'", with: "'\\''"))'")
         guard code == 0 else { throw InstallError(message: "rclone 密码编码失败") }
         let conf = """
         [quark]
@@ -662,24 +766,27 @@ final class Installer {
         _ = await shAsync("mkdir -p '\(mountPoint.path)' && chmod 755 '\(mountPoint.path)'")
         // === 挂载归属权：交给 LaunchAgent 守护进程（launchd 名下）===
         // App 只是控制面板：退出/崩溃/强杀都不影响挂载，重启后由 launchd 恢复
+        // 【必须先写 rclone.conf】守护进程随时可能挂载，没有配置它永远挂不上。
+        // v1.0.2 曾把唯一写入点放在下方「守护不在场」的兜底路径 → 全新安装必死路
+        // （等 60s 后抛「请重启电脑后重试」，而重启/重试走的都是同一条死路）。
+        // 详见 docs/AUDIT.md CRITICAL-4。
+        try await writeRcloneConf(state: state)
         await ensureAgentRunning(state: state)
         var waited = 0
         while waited < 60 {
-            if await isMountedAsync() {
-                let ours = await shAsync("pgrep -f 'rclone.*QuarkMount/rclone.conf'").1 == 0
-                state.log(ours
-                    ? "已挂载到 ~/Quark（后台守护持有，退出 App 不影响）"
-                    : "已挂载，跳过")
+            // 健康判定（条目 + rclone 进程都在才算数）：僵尸挂载条目不配就绪
+            if await isMountedHealthyAsync() {
+                state.log("已挂载到 ~/Quark（后台守护持有，退出 App 不影响）")
                 return
             }
             if waited % 15 == 0 { state.log("等待后台守护进程挂载…（\(waited)s）") }
-            try await Task.sleep(nanoseconds: 1_000_000_000)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
             waited += 1
         }
         // 守护进程还活着却挂不上：不能和它抢（pkill 会误杀它的 rclone），交给它自己恢复
         if await shAsync("pgrep -f 'QuarkMount/start-all.sh'").1 == 0 {
             let (log, _) = await shAsync("tail -5 '\(base.appendingPathComponent("mount.log").path)' 2>/dev/null")
-            throw InstallError(message: "后台守护进程未能完成挂载，请重启电脑后重试。日志：\(log.prefix(200))")
+            throw InstallError(message: "后台守护进程 60 秒内未能完成挂载（配置文件已就绪）。请打开 ~/Library/Application Support/QuarkMount/mount.log 查看原因后重试。日志尾部：\(log.prefix(200))")
         }
         // === 兜底：守护进程确实不在（plist 缺失/被禁用），App 自己挂 ===
         state.log("后台守护不可用，由 App 直接挂载")
@@ -688,7 +795,7 @@ final class Installer {
             state.log("卸载旧挂载以切换到本应用管理…")
             _ = await shAsync("diskutil unmount '\(mountPoint.path)' >/dev/null 2>&1 || umount '\(mountPoint.path)' >/dev/null 2>&1 || true")
             try await Task.sleep(nanoseconds: 2_000_000_000)
-            if isMounted() {
+            if await isMountedAsync() {
                 _ = await shAsync("diskutil unmount force '\(mountPoint.path)' >/dev/null 2>&1 || umount -f '\(mountPoint.path)' >/dev/null 2>&1 || true")
                 try await Task.sleep(nanoseconds: 1_000_000_000)
             }
@@ -704,8 +811,6 @@ final class Installer {
         if let n = Int(entries.trimmingCharacters(in: .whitespacesAndNewlines)), n > 0 {
             state.log("⚠️ ~/Quark 目录下原有 \(n) 个文件，挂载后会被暂时遮住（卸载 App 后恢复）")
         }
-        try await writeRcloneConf(state: state)
-
         let args = ["mount", "quark:/", mountPoint.path,
                     "--config", rcloneConf.path,
                     // —— 性能调优（v1.0.1 起）——
@@ -713,7 +818,7 @@ final class Installer {
                     "--vfs-cache-mode", "full",
                     "--cache-dir", base.appendingPathComponent("vfs-cache").path,
                     "--vfs-cache-max-size", "20G",
-                    "--vfs-cache-min-free-space", "5G",
+                    "--vfs-cache-min-free-space", "2G",   // 5G 会在小磁盘上整体停用缓存（AUDIT LOW）
                     "--vfs-cache-poll-interval", "5m",   // 后台缓存检查 1m→5m（省 CPU）
                     "--vfs-read-ahead", "64M",           // 顺序读预取：大文件/视频不卡顿
                     "--buffer-size", "32M",
@@ -739,11 +844,16 @@ final class Installer {
             if code != 0 { return false }
             for _ in 0..<30 {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if await isMountedAsync() { return true }
+                if await isMountedHealthyAsync() { return true }
             }
             return false
         }
 
+        // 记录挂载日志当前行数：EBUSY 判断只认本次尝试的新增日志。
+        // v1.0.2 用 tail -10 会取到上一轮残留的 busy 行——实测连续 5 次 SIGKILL 掉刚拉起的
+        // 健康 rclone、空转 6 分钟（start-all.log 有据可查）
+        let (markOut, _) = await shAsync("wc -l < '\(base.appendingPathComponent("mount.log").path)' 2>/dev/null || echo 0")
+        let logMark = Int(markOut.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         if await attemptMount() {
             state.log("已挂载到 ~/Quark")
             return
@@ -754,9 +864,10 @@ final class Installer {
             return
         }
         // EBUSY 恢复：残留的 rclone 守护进程卡在内核退出态占住挂载点（崩溃/强杀后的真实场景）
-        // 注意：busy 行在日志里排在 CRITICAL/ERROR 之前，必须看足够长的窗口
-        let (log, _) = await shAsync("tail -10 '\(base.appendingPathComponent("mount.log").path)' 2>/dev/null")
-        if log.lowercased().contains("busy") {
+        // 双重条件：① 本次尝试产生了 busy 日志 ② 确有残留 rclone 进程——避免陈旧日志误杀健康进程
+        let (log, _) = await shAsync("tail -n +\(logMark + 1) '\(base.appendingPathComponent("mount.log").path)' 2>/dev/null | tail -20")
+        let stuckRclone = await shAsync("pgrep -f 'Application Support/QuarkMount/rclone.conf'").1 == 0
+        if log.lowercased().contains("busy"), stuckRclone {
             state.log("挂载点被残留进程占用，正在自动恢复…")
             _ = await shAsync("pkill -9 -f 'Application Support/QuarkMount/rclone.conf' 2>/dev/null || true")
             try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -778,21 +889,40 @@ final class Installer {
         let script = base.appendingPathComponent("start-all.sh")
         let sh = """
         #!/bin/bash
-        # 夸克网盘守护：kext -> OpenList -> 挂载（掉了自动重挂）
+        # 夸克网盘守护：kext -> OpenList(循环内健康检查) -> 挂载(后台跑，循环持续照看)
+        # 关键设计（v1.1.0 加固，全部来自实测教训）：
+        #  1. rclone 必须后台化——前台运行会堵住循环，服务检查永远跑不到
+        #  2. 挂载健康 = 条目存在 **且** rclone 进程活着——只用 mount | grep 会被僵尸挂载骗过
+        #     （rclone 被 kill -9/崩溃后条目残留、ls 报 Device not configured，守护却永不重挂）
+        #  3. 任何故障路径只 log + sleep，绝不 exit——KeepAlive 下 exit = 每秒重启的崩溃循环
+        #  4. EBUSY 恢复只认本次尝试的新增日志——陈旧 busy 行会误杀刚拉起的健康 rclone
+        #  5. rclone.conf 是挂载硬前置，缺失时等待而不是反复空跑刷日志
         BASE="\(base.path)"
         LOG="$BASE/start-all.log"
+        MLOG="$BASE/mount.log"
+        MOUNTPT="\(mountPoint.path)"
+        RCLONE="$BASE/bin/rclone"
         log(){ echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+
+        # 日志轮换（无界增长：INFO 级 + vfs-cache full 事件量，常驻数月可达数十 MB）
+        rotate(){ for f in "$LOG" "$MLOG" "$BASE/openlist.log"; do
+            if [ -f "$f" ] && [ "$(stat -f%z "$f" 2>/dev/null || echo 0)" -gt 20971520 ]; then
+              mv -f "$f" "$f.1" 2>/dev/null; : > "$f" 2>/dev/null; log "日志轮换：$f"
+            fi
+          done; }
+
+        # 挂载健康判定：条目 + 进程双条件（僵尸条目不算健康）
+        mount_ok(){ mount | grep -q " on $MOUNTPT " && pgrep -f 'Application Support/QuarkMount/rclone.conf' >/dev/null 2>&1; }
 
         if ! kextstat 2>/dev/null | grep -q macfuse; then
           /Library/Filesystems/macfuse.fs/Contents/Resources/load_macfuse >> "$LOG" 2>&1 || log "kext 加载失败"
         fi
-        RCLONE="$BASE/bin/rclone"
-        MOUNTPT="\(mountPoint.path)"
+
         while true; do
-          # 服务健康检查进循环：App 退出会带走它启动的 openlist，守护必须能复活。
-          # 注意：rclone 必须后台运行——前台运行会堵住整个循环，服务检查永远跑不到
-          if ! curl -s -o /dev/null --max-time 3 http://127.0.0.1:5244/; then
-            # 数据目录不存在（卸载残留/被误删）：绝不能 exit——KeepAlive 会立刻重启，形成崩溃循环
+          rotate
+          # —— 服务健康检查（--fail：5xx 也视为异常，与 App 侧 serviceRunning 语义一致）——
+          if ! curl -s --fail -o /dev/null --max-time 3 http://127.0.0.1:5244/; then
+            # 数据目录不存在（卸载残留/被误删）：绝不能 exit——KeepAlive 会立刻重启形成崩溃循环
             if [ ! -d "$BASE" ] || [ ! -x "$BASE/bin/openlist" ]; then
               log "数据目录或组件缺失（$BASE），60s 后重试；如已卸载请删除 LaunchAgent"
               sleep 60
@@ -800,29 +930,50 @@ final class Installer {
             fi
             cd "$BASE" || true
             OPENLIST_ADMIN_PASSWORD="$(cat "$BASE/.admin-pass" 2>/dev/null)" nohup "$BASE/bin/openlist" server >> "$BASE/openlist.log" 2>&1 &
-            for _ in $(seq 1 30); do curl -s -o /dev/null --max-time 2 http://127.0.0.1:5244/ && break; sleep 1; done
-            log "OpenList 已启动（或重试中）"
+            log "OpenList 启动中…"
+            for _ in $(seq 1 30); do
+              curl -s --fail -o /dev/null --max-time 2 http://127.0.0.1:5244/ && break
+              sleep 1
+            done
           fi
-          if ! mount | grep -q " on $MOUNTPT "; then
+
+          # —— 挂载检查（后台运行，循环继续照看服务）——
+          if ! mount_ok; then
             if [ ! -x "$RCLONE" ]; then
               log "rclone 不存在（$RCLONE），60s 后重试"
               sleep 60
               continue
             fi
+            # 僵尸挂载清理：条目在但 rclone 进程死了（kill -9/崩溃）——文件系统已不可用，
+            # 不清掉条目的话 mount | grep 恒真，永远走不到重挂（v1.0.2 实测卡死在此）
+            if mount | grep -q " on $MOUNTPT "; then
+              log "检测到无效挂载条目（rclone 进程不在），清理后重挂"
+              diskutil unmount force "$MOUNTPT" >/dev/null 2>&1 || umount -f "$MOUNTPT" >/dev/null 2>&1
+              sleep 1
+            fi
+            # rclone.conf 是挂载硬前置：没有它就等，别反复空跑刷日志
+            if [ ! -s "$BASE/rclone.conf" ]; then
+              log "rclone.conf 缺失，等待配置写入（App 部署会写）…"
+              sleep 10
+              continue
+            fi
+            # 记录日志行数：EBUSY 判断只认本次尝试的新增行（陈旧 busy 行会误杀健康 rclone）
+            MARK=$(wc -l < "$MLOG" 2>/dev/null || echo 0)
             log "开始挂载"
-            "$RCLONE" mount quark:/ "$MOUNTPT" --config "$BASE/rclone.conf" --vfs-cache-mode full --cache-dir "$BASE/vfs-cache" --vfs-cache-max-size 20G --vfs-cache-min-free-space 5G --vfs-cache-poll-interval 5m --vfs-read-ahead 64M --buffer-size 32M --vfs-write-back 30s --transfers 8 --checkers 8 --dir-cache-time 10m --attr-timeout 10m --poll-interval 0 --timeout 30s --contimeout 10s --low-level-retries 3 --retries 3 --no-checksum --noapplexattr --volname Quark --log-file "$BASE/mount.log" --log-level INFO &
+            "$RCLONE" mount quark:/ "$MOUNTPT" --config "$BASE/rclone.conf" --vfs-cache-mode full --cache-dir "$BASE/vfs-cache" --vfs-cache-max-size 20G --vfs-cache-min-free-space 2G --vfs-cache-poll-interval 5m --vfs-read-ahead 64M --buffer-size 32M --vfs-write-back 30s --transfers 8 --checkers 8 --dir-cache-time 10m --attr-timeout 10m --poll-interval 0 --timeout 30s --contimeout 10s --low-level-retries 3 --retries 3 --no-checksum --noapplexattr --volname Quark --log-file "$MLOG" --log-level INFO &
             ok=0
             for _ in $(seq 1 30); do
               sleep 1
-              if mount | grep -q " on $MOUNTPT "; then ok=1; break; fi
+              if mount_ok; then ok=1; break; fi
             done
             if [ "$ok" = "1" ]; then
               log "挂载成功"
             else
               log "挂载未就绪"
-              # EBUSY 自恢复：残留守护进程占住挂载点 → 清理后重建目录节点
-              if tail -10 "$BASE/mount.log" 2>/dev/null | grep -qi "busy"; then
-                log "挂载点被占用，执行恢复"
+              # EBUSY 自恢复：只认本次新增日志 **且** 确有残留 rclone 进程，才清理重建目录节点
+              NEWBUSY=$(tail -n +$((MARK + 1)) "$MLOG" 2>/dev/null | tail -20 | grep -ci busy)
+              if [ "${NEWBUSY:-0}" -gt 0 ] && pgrep -f 'Application Support/QuarkMount/rclone.conf' >/dev/null 2>&1; then
+                log "挂载点被残留进程占用，执行恢复"
                 pkill -9 -f 'Application Support/QuarkMount/rclone.conf' 2>/dev/null
                 sleep 1
                 rmdir "$MOUNTPT" 2>/dev/null
@@ -830,6 +981,7 @@ final class Installer {
               fi
             fi
           fi
+
           sleep 10
         done
         """
@@ -876,7 +1028,12 @@ final class Installer {
         let uid = getuid()
         // 顺序有讲究：先停开机项（否则守护脚本会把挂载重新拉起来），再卸载，最后才删数据
         _ = await shAsync("launchctl bootout gui/\(uid)/\(launchLabel) 2>/dev/null")
-        let agentGone = await shAsync("launchctl list | grep -q '\(launchLabel)'").1 != 0
+        // bootout 异步生效：轮询几次再判定，否则误报「开机项未能停止」诱发用户无谓重启
+        var agentGone = false
+        for _ in 0..<4 {
+            if await shAsync("launchctl list | grep -q '\(launchLabel)'").1 != 0 { agentGone = true; break }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
         // 优雅卸载优先；强卸载会让 rclone 卡在内核退出态占住目录
         _ = await shAsync("diskutil unmount '\(mountPoint.path)' >/dev/null 2>&1 || umount '\(mountPoint.path)' >/dev/null 2>&1")
         try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -904,6 +1061,7 @@ final class Installer {
         state.deployed = false
         state.mountOK = false
         state.phase = .idle
+        state.uninstalling = false
         if unmounted && agentGone {
             state.log("已卸载：服务停止、挂载卸载、开机项移除、数据目录已删除")
         } else {

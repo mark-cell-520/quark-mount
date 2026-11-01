@@ -139,3 +139,55 @@
 | LOW | 存储列表未按挂载路径过滤，多 Quark 存储时更新错对象；URLSession.shared 缓存可能读到陈旧响应；curl 无断点续传；日志无自动滚动；版本号硬编码 | 按 mount_path 过滤并全量刷新；校验/列表改用 ephemeral 会话；curl 加 `-C -` 续传；日志自动滚到底 + 打开日志按钮；build.sh 注入 VERSION |
 
 **性能专项**（rclone 挂载参数重调，实测数据）：`--vfs-cache-mode full --cache-dir <支持目录>/vfs-cache --vfs-cache-max-size 20G --vfs-cache-min-free-space 5G`（读也进缓存）+ `--vfs-read-ahead 64M --buffer-size 32M --transfers/checkers 8` + `--timeout 30s --contimeout 10s --low-level-retries 3`（卡住最多 30s 失败）+ `--poll-interval 0 --vfs-cache-poll-interval 5m --no-checksum`（砍后台请求）。实测：进目录 0.23s/缓存后 0.006s；大文件二次打开 0.007s（原需重新走网络）；20MB 写入 0.044s 秒回；常驻 RSS 无回归（rclone 59M / openlist 74M）。安装流程并行化：部署开始即并行下载全部缺失组件，全新部署从 ~7 分钟降到 ~4 分钟，且修复了 detect 在无 plist 时傻等 60s 才进部署的问题（启动到下载开始 80s → 8s）。
+
+## 第四轮审计修复（v1.1.0，2026-11-02：性能/稳定性实测 + 双路子代理复审 + 主代理复验）
+
+本轮三段式：① 对运行中的真机部署做性能基线 + 稳定性破坏性实测；② 两个并行只读子代理复审全量代码（30 条发现）；③ 主代理逐条复验后修复。**修复后用真机复测验证**（见文末）。无 CRITICAL 遗留；1 个 CRITICAL（全新安装死路）已修复并通过全新部署实测。
+
+### CRITICAL
+
+| 级别 | 发现 | 修复 |
+|---|---|---|
+| CRITICAL | **全新安装挂载死路（v1.0.2 的顺序修正引入）**：`setupAutoStart 先于 mount` 后，rclone.conf 的唯一写入点被留在「守护进程不在场」的兜底路径里。干净机器上守护先跑、没有配置、挂载必败；App 等 60s 后抛「请重启电脑后重试」，而重启/重试走同一条路——永久卡死。本机一直正常只因 rclone.conf 是旧版本（23:41）遗留、早于守护首跑（23:43），恰好掩盖 | mount() 进入等待循环**之前**先写 rclone.conf；守护脚本 conf 缺失时等待（不反复空跑刷日志）；错误消息改为可行动提示。**已用全新部署实测复验** |
+
+### HIGH
+
+| 级别 | 发现 | 修复 |
+|---|---|---|
+| HIGH（稳定性实测复现） | **僵尸挂载骗过所有健康检查**：rclone 被 kill -9/崩溃后 macFUSE 条目残留——`mount` 显示挂载中、rclone 进程已死、`ls` 报 `Device not configured`。守护进程的 `mount \| grep` 检查恒真，永不重挂；App 的 mount()/remount()/detect() 恢复路径同样被骗出假「已就绪」 | 健康判定改为**双条件：挂载条目存在 + rclone 进程活着**（App `isMountedHealthyAsync()` + 守护脚本 `mount_ok()`）；守护检测到僵尸先 `diskutil unmount force` 清条目再重挂。App 侧 mount/remount/detect 全部切换 |
+| HIGH | **uninstall 无重入/代际保护**：卸载进行中（数秒无反馈窗口）footer「重新部署」仍可点，runAll 与 uninstall 并发——pkill 杀掉刚起的服务、removeItem(base) 删掉刚部署的组件，uninstall 收尾还把 phase 改回 .idle | `uninstalling` 忙态 + 取消在途 deploy/remount/refresh 任务 + startDeploy/remount/checkExisting 入口闸门 + 按钮禁用 |
+| HIGH | **detect() 网络错误早退前已写 cookieValid/deployed=false**：一次网络抖动（如重开窗口触发第二次 detect）就把就绪页静默降级成「开始部署」，诱导用户对健康挂载做 takeover 重部署 | networkError 早退移到改写状态之前；挂载检测同步换健康判定 |
+| HIGH | **Intel(amd64) 全部组件零 SHA256 校验**：assetFor 在 amd64 下清空 sha256，assetsAmd64 全为空，连架构无关的 macFUSE dmg 也被清——第三方镜像优先的策略下投毒可直通 LaunchAgent + kext | 补全官方哈希：rclone amd64 取自官方 PGP 签名 SHA256SUMS；openlist amd64 经**官方 md5.txt 交叉验证链**（镜像包 md5 对上官方值 ⇒ 文件即官方文件，其 SHA256 合法）；macFUSE dmg 架构无关，复用 arm64 官方值；无 amd64 变体时保留原哈希不清空 |
+
+### MEDIUM
+
+| 级别 | 发现 | 修复 |
+|---|---|---|
+| MEDIUM | 磁盘空间预检是死代码：`$HOME` 被单引号包裹不展开，df 直接报错，400MB 闸门从不触发（两处同错，AUDIT 旧记录自认「未构造低磁盘环境」） | 路径内联 `\(home.path)`，双引号包裹 |
+| MEDIUM | downloads 目录只增不删（实测残留 82MB）+ 取消部署后 curl 子进程仍在后台下满 15 分钟 | 部署成功即清理安装包（日志报告释放量）；curl 包 withTaskCancellationHandler，取消时 terminate 进程 |
+| MEDIUM | EBUSY 自恢复用陈旧日志误判：`tail -10` 取到上一轮残留的 busy 行——实测连续 5 次 SIGKILL 掉刚拉起的健康 rclone、空转 6 分钟（start-all.log 有据） | 恢复条件改为：① 只认本次尝试的新增日志（尝试前记行数）② pgrep 确认确有残留 rclone 进程 |
+| MEDIUM | mount.log / start-all.log / openlist.log 无轮换，长期运行无界增长 | 守护脚本 rotate()：超 20MB 滚成 .1（AUDIT 旧记录「日志自动滚动」名不副实，实为 openlist 内部日志） |
+| MEDIUM | 陈旧 openlist 占端口 → 重部署必 401 且错误不可行动（卸载半失败/App 被强杀后的孤儿进程） | apiLogin 遇 401/403：杀陈旧实例 → 等端口释放 → 用当前密码重启 → 重试一次 |
+| MEDIUM | config.json「仅不存在才写」：0.0.0.0 旧配置永远不被纠正（局域网暴露） | 每次启动校验 scheme.address/http_port，不一致即重写并重启服务生效 |
+| MEDIUM | addStorage 丢弃 storage/list 的 HTTP 状态码：5xx/错误体被当成空列表 → 静默走 create 建出重复存储 | guard 状态码 + code==200，拿不到列表明确失败 |
+| MEDIUM | 「重新扫码/重新获取二维码」名不副实：就绪页点它 = 整包重部署 + takeover 拆健康挂载 + 进度条归零 | 新增 QuarkAuth.refreshLogin：只换 cookie + 更新存储配置，不动挂载/组件/守护 |
+| MEDIUM | remount 失败后不清脏状态：界面仍显示「一切就绪」而 Finder 打不开；deployed 判定用数小时前的陈旧 cookieValid | 失败即清 mountOK/deployed；判定前重新校验 cookie（networkError 保守保留） |
+| MEDIUM | 「部署完成」页没有任何管理入口（卸载只能关窗重开）；「完成」按钮 keyWindow 为 nil 时是死按钮 | doneView 补按钮组（打开日志/重新扫码/卸载）；closeWindow 回退可见窗口 |
+| MEDIUM | 已就绪时 footer「重新部署」绑定 Return 默认键，误按即卸载健康挂载，无确认 | deployed 时去默认键 + NSAlert 二次确认（说明会中断传输中的文件） |
+
+### LOW（全部已修）
+
+守护 curl 缺 `--fail`（与 App 侧语义不一致）；sh() 先 waitUntilExit 再读管道（64KB 输出即永久挂起的潜伏锁）；mount() 残留一处同步 isMounted()；agentGone 判定竞态误报；外部挂载被当「已挂载，跳过」成功；rclone obscure 密码单引号注入面；dmg 卷 glob+head -1 选到陈旧卷/竞态误报；误杀用户自己的 openlist 实例（改为仅端口 5244 被占才杀 + 日志明示）；下载无断点续传（`-C -` + 分片保留 + 毒文件删除）；vfs-cache-min-free-space 5G 小磁盘整体停用缓存（降 2G）；build.sh 不更新 CFBundleVersion、不校验 VERSION；troubleshooting.md 教 `pkill -x rclone`（会杀用户自己的挂载，改精确匹配）；日志满 300 条后自动滚动失效（onChange 改 last?.id）；makeQR 用 .ascii 静默返回 nil（改 utf8 + 失败抛错）；DateFormatter 每次 log 新建（提 static）；qrCountdown 死状态（改为显示）；二维码/图标缺无障碍标签；**源码与线上守护脚本分叉**（attr-timeout 等参数线上缺失——模板统一并补齐）。
+
+### 性能基线（v1.0.2 真机实测，v1.1.0 无回归）
+
+目录列举冷 0.39s / 热 0.006s；二级目录 0.34s；4.4MB 文件冷读 2.39s / 热读 0.00s；小文件写 0.01s；write-back 30s 上传实测生效（PROPFIND HTTP 207）；删除 5s 同步（404）；常驻 RSS openlist 67.5MB / rclone 58.6MB（重启后；运行数小时的 78.6MB 为 Go 堆惰性未归还，非泄漏）。
+
+### 稳定性实测（破坏性测试）
+
+杀 openlist（TERM）→ 3s 自愈，挂载存活；杀 rclone（TERM）→ 1-2s 重挂；同时杀双进程 → 12s 全栈恢复；**kill -9 rclone → 僵尸挂载复现**（v1.0.2 缺陷，本 AUDIT HIGH 项）→ force unmount 后守护 7s 重挂。v1.1.0 守护脚本（bash -n 通过）+ App（swiftc -parse 通过）同场景复测见发布记录。
+
+### 已知限制（新增）
+
+- 挂载健康判定不覆盖「rclone 进程活着但 wedge 卡死」的中间态（功能性探测会因网络超时阻塞守护循环，权衡取舍）；进程死 + 条目留（僵尸）已全覆盖
+- amd64 openlist 哈希经官方 md5.txt 交叉验证链获得（官方不发布 sha256）；arm64 三项与 rclone amd64 均为官方直出哈希
