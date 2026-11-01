@@ -42,6 +42,7 @@ final class AppState: ObservableObject {
 
     var deployTask: Task<Void, Never>?      // 进行中的部署任务（防重入）
     var deployGeneration = 0                // 部署代际：旧任务的结果不得改写新任务状态
+    var remountTask: Task<Void, Never>?     // 重新挂载任务（进行中禁用按钮）
 
     static var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
@@ -124,6 +125,27 @@ final class AppState: ObservableObject {
         s.phase = .idle
         // 未部署则自动开始（一键体验：打开即用）
         if !s.deployed {
+            // 轻量恢复：登录还有效、只是挂载/服务没上（开机竞态、守护被杀）→ 唤醒守护进程即可，
+            // 不必重新部署（takeover 会卸载正常挂载，代价大）
+            if s.cookieValid {
+                s.log("挂载未就绪但登录有效，尝试唤醒后台守护进程…")
+                await Installer.ensureAgentRunning(state: s)
+                var recovered = false
+                for _ in 0..<60 {
+                    if await Installer.isMountedAsync(), await Installer.serviceRunning() {
+                        recovered = true
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+                if recovered {
+                    s.mountOK = true
+                    s.deployed = true
+                    s.phase = .finished
+                    s.log("后台守护已恢复：挂载 ✅ 服务 ✅")
+                    return
+                }
+            }
             s.log("未检测到完整部署，自动开始一键部署")
             s.startDeploy()
         }
@@ -209,6 +231,29 @@ final class AppState: ObservableObject {
 
     func uninstall() {
         Task { await Installer.uninstall(state: self) }
+    }
+
+    /// 重新挂载：唤醒后台守护进程等它挂（App 自己永不当挂载的主人）
+    func remount() {
+        guard phase == .idle || phase == .finished else { return }
+        guard remountTask == nil else { return }
+        log("正在重新挂载（唤醒后台守护进程）…")
+        remountTask = Task {
+            await Installer.ensureAgentRunning(state: self)
+            var ok = false
+            for _ in 0..<60 {
+                if await Installer.isMountedAsync() { ok = true; break }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            if ok {
+                mountOK = true
+                deployed = await Installer.serviceRunning() && cookieValid
+                log("✅ 已重新挂载到 ~/Quark（后台守护持有，退出 App 不影响）")
+            } else {
+                log("❌ 重新挂载失败。请查看 ~/Library/Application Support/QuarkMount/start-all.log")
+            }
+            remountTask = nil
+        }
     }
 }
 
