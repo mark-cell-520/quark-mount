@@ -166,7 +166,13 @@ final class Installer {
             state.log("安装 macFUSE（需要你在弹出框输入密码）…")
             let src = "do shell script \"installer -pkg '\(pkg)' -target /\" with administrator privileges"
             var err: NSDictionary?
-            NSAppleScript(source: src)?.executeAndReturnError(&err)
+            // 授权对话框可能持续数分钟：放后台队列执行，避免阻塞 UI 线程
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    NSAppleScript(source: src)?.executeAndReturnError(&err)
+                    cont.resume()
+                }
+            }
             _ = await shAsync("hdiutil detach -quiet '\(vol)'")
             if err != nil {
                 throw InstallError(message: "macFUSE 安装失败：\(err?["NSAppleScriptErrorNumber"] ?? "未知")")
@@ -210,11 +216,20 @@ final class Installer {
 
         // openlist
         if !fm.fileExists(atPath: openlistBin.path) {
+            var imported = false
             let legacy = legacyDir.appendingPathComponent("openlist")
             if fm.fileExists(atPath: legacy.path) {
                 state.log("从旧部署导入 openlist…")
-                try? fm.copyItem(at: legacy, to: openlistBin)
-            } else {
+                do {
+                    try fm.copyItem(at: legacy, to: openlistBin)
+                    imported = true
+                } catch {
+                    // 导入失败（损坏/权限/跨卷）不能当作成功——清理后回退到下载
+                    state.log("导入失败（\(error.localizedDescription)），改为下载…")
+                    try? fm.removeItem(at: openlistBin)
+                }
+            }
+            if !imported {
                 state.log("下载 OpenList 组件（\(arch)）…")
                 let tar = try await download(assetFor("openlist")!, state: state)
                 _ = await shAsync("tar xzf '\(tar.path)' -C '\(base.path)' && mv -f '\(base.path)/openlist' '\(openlistBin.path)'")
@@ -230,11 +245,19 @@ final class Installer {
 
         // rclone
         if !fm.fileExists(atPath: rcloneBin.path) {
+            var imported = false
             let legacy = legacyDir.appendingPathComponent("rclone-v1.75.2-osx-\(arch)/rclone")
             if fm.fileExists(atPath: legacy.path) {
                 state.log("从旧部署导入 rclone…")
-                try? fm.copyItem(at: legacy, to: rcloneBin)
-            } else {
+                do {
+                    try fm.copyItem(at: legacy, to: rcloneBin)
+                    imported = true
+                } catch {
+                    state.log("导入失败（\(error.localizedDescription)），改为下载…")
+                    try? fm.removeItem(at: rcloneBin)
+                }
+            }
+            if !imported {
                 state.log("下载 rclone 组件（\(arch)）…")
                 let zip = try await download(assetFor("rclone")!, state: state)
                 _ = await shAsync("cd '\(base.path)' && unzip -o -q '\(zip.path)' && mv -f '\(base.path)/rclone-v1.75.2-osx-\(arch)/rclone' '\(rcloneBin.path)' && rm -rf '\(base.path)/rclone-v1.75.2-osx-\(arch)'")
@@ -333,7 +356,8 @@ final class Installer {
     // MARK: Step 2: 启动服务 + 账号权限
 
     static func serviceRunning() async -> Bool {
-        await shAsync("curl -s -o /dev/null --max-time 3 http://127.0.0.1:\(port)/").1 == 0
+        // --fail：5xx/4xx 视为异常（服务活着但内部错误时不能当就绪）
+        await shAsync("curl -s --fail -o /dev/null --max-time 3 http://127.0.0.1:\(port)/").1 == 0
     }
 
     static func startService(state: AppState) async throws {
@@ -358,7 +382,11 @@ final class Installer {
               "token_expires_in": 48
             }
             """
-            try? json.write(to: conf, atomically: true, encoding: .utf8)
+            do {
+                try json.write(to: conf, atomically: true, encoding: .utf8)
+            } catch {
+                throw InstallError(message: "配置文件写入失败：\(error.localizedDescription)")
+            }
         }
 
         // 启动（环境变量方式确保 admin 被创建）
@@ -367,8 +395,17 @@ final class Installer {
             pass = s
         } else {
             pass = randomPassword()
-            try? pass.write(to: passFile, atomically: true, encoding: .utf8)
-            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passFile.path)
+            do {
+                try pass.write(to: passFile, atomically: true, encoding: .utf8)
+                try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passFile.path)
+            } catch {
+                throw InstallError(message: "管理员密码保存失败：\(error.localizedDescription)")
+            }
+            // 读回校验：写坏了会让下次部署用新密码登录正在跑的服务（必 401）
+            let readBack = (try? String(contentsOf: passFile, encoding: .utf8)) ?? ""
+            guard readBack == pass else {
+                throw InstallError(message: "管理员密码写入校验失败，请重试")
+            }
         }
 
         if !(await serviceRunning()) {
@@ -401,7 +438,10 @@ final class Installer {
                 try await Task.sleep(nanoseconds: 1_000_000_000)
                 if await serviceRunning() { ok = true; break }
             }
-            guard ok else { throw InstallError(message: "OpenList 服务启动超时") }
+            guard ok else {
+                let (log, _) = await shAsync("tail -15 '\(base.appendingPathComponent("openlist.log").path)' 2>/dev/null")
+                throw InstallError(message: "OpenList 服务启动超时。\(log.prefix(300))")
+            }
         }
         state.log("服务已就绪 (127.0.0.1:\(port))")
 
@@ -482,6 +522,11 @@ final class Installer {
         sh("mount | grep -q ' on \(mountPoint.path) '").1 == 0
     }
 
+    /// 异步版：轮询循环/检测用，避免同步 Process 阻塞主线程
+    static func isMountedAsync() async -> Bool {
+        await shAsync("mount | grep -q ' on \(mountPoint.path) '").1 == 0
+    }
+
     static func writeRcloneConf(state: AppState) async throws {
         let pass = (try? String(contentsOf: passFile, encoding: .utf8)) ?? ""
         let (obscured, code) = await shAsync("'\(rcloneBin.path)' obscure '\(pass)'")
@@ -504,12 +549,12 @@ final class Installer {
         _ = await shAsync("mkdir -p '\(mountPoint.path)' && chmod 755 '\(mountPoint.path)'")
         // 已是本应用管理的挂载才跳过
         let ours = await shAsync("pgrep -f 'rclone.*QuarkMount/rclone.conf'").1 == 0
-        if isMounted() && ours {
+        if await isMountedAsync() && ours {
             state.log("已挂载，跳过")
             return
         }
         // 卸载残留（旧部署的挂载）——优雅优先，强卸载会让 rclone 卡死占住目录
-        if isMounted() {
+        if await isMountedAsync() {
             state.log("卸载旧挂载以切换到本应用管理…")
             _ = await shAsync("diskutil unmount '\(mountPoint.path)' >/dev/null 2>&1 || umount '\(mountPoint.path)' >/dev/null 2>&1 || true")
             try await Task.sleep(nanoseconds: 2_000_000_000)
@@ -548,7 +593,7 @@ final class Installer {
             if code != 0 { return false }
             for _ in 0..<30 {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if isMounted() { return true }
+                if await isMountedAsync() { return true }
             }
             return false
         }
@@ -558,7 +603,8 @@ final class Installer {
             return
         }
         // EBUSY 恢复：残留的 rclone 守护进程卡在内核退出态占住挂载点（崩溃/强杀后的真实场景）
-        let (log, _) = await shAsync("tail -4 '\(base.appendingPathComponent("mount.log").path)' 2>/dev/null")
+        // 注意：busy 行在日志里排在 CRITICAL/ERROR 之前，必须看足够长的窗口
+        let (log, _) = await shAsync("tail -10 '\(base.appendingPathComponent("mount.log").path)' 2>/dev/null")
         if log.lowercased().contains("busy") {
             state.log("挂载点被残留进程占用，正在自动恢复…")
             _ = await shAsync("pkill -9 -x rclone 2>/dev/null || true")
@@ -608,7 +654,7 @@ final class Installer {
           code=$?
           log "挂载退出(code=$code)"
           # EBUSY 自恢复：残留守护进程占住挂载点 → 清理后重建目录节点
-          if [ "$code" != "0" ] && tail -4 "$BASE/mount.log" 2>/dev/null | grep -qi "busy"; then
+          if [ "$code" != "0" ] && tail -10 "$BASE/mount.log" 2>/dev/null | grep -qi "busy"; then
             log "挂载点被占用，执行恢复"
             pkill -9 -x rclone 2>/dev/null
             sleep 1
@@ -664,6 +710,16 @@ final class Installer {
         try? await Task.sleep(nanoseconds: 2_000_000_000)
         _ = await shAsync("diskutil unmount force '\(mountPoint.path)' >/dev/null 2>&1 || umount -f '\(mountPoint.path)' >/dev/null 2>&1 || true")
         _ = await shAsync("pkill -x rclone 2>/dev/null || true")
+        // 必须停掉 OpenList 服务进程：否则孤儿进程占着 5244 和数据目录，下次部署必败
+        retainedProcess?.terminate()
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        _ = await shAsync("pkill -f 'Application Support/QuarkMount/bin/openlist' 2>/dev/null || true")
+        retainedProcess = nil
+        // 等端口释放（最多 5 秒）
+        for _ in 0..<5 {
+            if await shAsync("curl -s -o /dev/null --max-time 2 http://127.0.0.1:\(port)/").1 != 0 { break }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
         try? fm.removeItem(at: home.appendingPathComponent("Library/LaunchAgents/\(launchLabel).plist"))
         try? fm.removeItem(at: base)
         state.deployed = false

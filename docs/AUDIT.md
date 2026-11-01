@@ -77,6 +77,26 @@
 - **复验**：全新部署后 DB 显示 `admin id=1 / guest id=2`，权限值证实修复打错了对象。
 - **修复**：先 `GET /api/admin/user/list` 按 `role==2`（ADMIN）动态定位 admin 的 id，再取其完整对象修改；权限目标从「仅补 bit9」改为「补齐 OpenList 标准 admin 掩码 `0x73FF`」（建号的初始权限值不稳定，OR 完整掩码更稳）。
 
+## 第二轮审计修复（v1.0.1，交付正式结果后对账补修）
+
+正式审计结果送达后逐条对账，发现第一轮漏修 4 项 + 修复过程新暴露 1 项，全部已修复：
+
+| 级别 | 发现 | 修复 |
+|---|---|---|
+| HIGH | **卸载不停止 OpenList 服务进程**：只 bootout+删文件，`retainedProcess` 持有的 openlist 变孤儿继续占 5244，下次部署 `serviceRunning` 误判就绪、mount 用已删除的二进制必败 | uninstall 先 `terminate()` + pkill 兜底，**轮询确认端口释放**再删目录 |
+| HIGH | **扫码轮询无退避无错误 surfacing**：`try?` 吞掉所有网络错误后静默 continue，用户对着"等待扫码"白等 180 秒；固定 2s 轮询在限频时加重 429 | 指数退避（2→4→8s 封顶）+ 连续失败 5 次即报错 + 请求显式 15s 超时 |
+| HIGH | **`.qr` 相位可重入且旧任务永不取消**：rescan 直接 startDeploy，旧 qrLogin 轮询 180s 后抛"已过期"把新二维码打成失败页；反复点击累积多个并发部署 | deployTask 取消 + **代际（generation）机制**：旧任务的 catch/defer 一律不得改写新任务状态；轮询循环检查 `Task.isCancelled` |
+| MEDIUM | isMounted() 同步 Process 在主线程执行，挂载轮询每秒卡顿一次 UI | 新增 `isMountedAsync()`，轮询/检测/接管全部改异步 |
+| MEDIUM | 旧部署导入二进制 `try? copyItem` 吞错：文件损坏/属主异常时直接报"部署失败"，不回退下载 | do/catch + 失败即清理回退下载分支 |
+| MEDIUM | config.json 写入 `try?` 静默吞错：失败时 openlist 按默认配置启动，**可能绑定 0.0.0.0 暴露到局域网** | 写入改 `try` 向上抛错，部署终止 |
+| MEDIUM | OpenList 启动 30s 超时不附日志，真实原因（JSON 坏/端口占）用户看不到 | 超时错误附 `tail -15 openlist.log` |
+| MEDIUM | NSAppleScript 授权对话框在主线程同步执行，输密码期间整个 UI 转风车 | 派发后台队列执行 |
+| LOW | serviceRunning 不带 `--fail`：服务内部 500 也被当就绪 | 加 `--fail` |
+| LOW | admin 密码写入无校验：写坏后下次部署用新密码登录正在跑的服务必 401 | 写后读回校验一致性 |
+| **修复暴露的新 bug** | **EBUSY 自动恢复失效**：`tail -4` 取的日志窗口不含 "Resource busy" 行（它在 CRITICAL/ERROR 之前），恢复条件永不命中 | 日志窗口改 `tail -10`（App 与守护脚本同修）——这个 bug 是完整卸载+重部署测试才暴露的 |
+
+**第二轮复验**：模拟完整卸载（含新加的杀 openlist+等端口释放）→ 确认无孤儿进程、端口释放 → 全新下载部署（SHA256 校验通过）→ **用户真实扫码**（最终构建的扫码链路端到端验证）→ 挂载/权限/LaunchAgent/读/传/删全部通过。
+
 ## 复验记录（每条修复都有真机证据）
 
 | 修复 | 验证方式 | 结果 |

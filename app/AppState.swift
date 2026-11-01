@@ -41,6 +41,7 @@ final class AppState: ObservableObject {
     @Published var showMacFuseHelp = false  // macFUSE 开通指南弹窗
 
     var deployTask: Task<Void, Never>?      // 进行中的部署任务（防重入）
+    var deployGeneration = 0                // 部署代际：旧任务的结果不得改写新任务状态
 
     static var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
@@ -72,12 +73,12 @@ final class AppState: ObservableObject {
     // MARK: 接管旧部署（防止旧 rclone 拿旧凭证狂试新服务触发登录限频）
 
     private func takeover() async {
-        if Installer.isMounted() {
+        if await Installer.isMountedAsync() {
             log("卸载现有挂载（交由本应用管理）…")
             // 先优雅卸载（让 rclone 自行退出），失败才强卸载（强卸载可能使进程卡死占住目录）
             _ = await Installer.shAsync("diskutil unmount '\(Installer.mountPoint.path)' >/dev/null 2>&1 || umount '\(Installer.mountPoint.path)' >/dev/null 2>&1 || true")
             try? await Task.sleep(nanoseconds: 2_000_000_000)
-            if Installer.isMounted() {
+            if await Installer.isMountedAsync() {
                 _ = await Installer.shAsync("diskutil unmount force '\(Installer.mountPoint.path)' >/dev/null 2>&1 || umount -f '\(Installer.mountPoint.path)' >/dev/null 2>&1 || true")
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
@@ -107,7 +108,7 @@ final class AppState: ObservableObject {
         // 检测期间状态被别处改动（用户点了开始/另一窗口）则放弃本次结果
         guard s.phase == .checking else { return }
         s.macfuseReady = await Installer.isMacFuseReady()
-        s.mountOK = Installer.isMounted()
+        s.mountOK = await Installer.isMountedAsync()
         let cookieState = await QuarkAuth.hasValidCookie()
         s.cookieValid = (cookieState == .valid)
         let svc = await Installer.serviceRunning()
@@ -129,17 +130,20 @@ final class AppState: ObservableObject {
     }
 
     func startDeploy() {
-        // 防重入：已有部署任务在跑则忽略
         guard phase == .idle || phase == .failed || phase == .qr else { return }
-        guard deployTask == nil else { return }
+        // 取消旧任务（重新扫码场景）；用 generation 防止旧任务的 catch/defer 踩新任务的状态
+        deployTask?.cancel()
+        deployGeneration += 1
+        let gen = deployGeneration
         fatalError = nil
         resetSteps()
         phase = .running
-        deployTask = Task { await runAll() }
+        deployTask = Task { await runAll(generation: gen) }
     }
 
-    private func runAll() async {
-        defer { deployTask = nil }   // 收尾必清，允许下次部署
+    private func runAll(generation: Int) async {
+        // 只有「仍是当前代」才清理/改写状态，旧任务晚到的结果一律丢弃
+        defer { if generation == deployGeneration { deployTask = nil } }
         do {
             await takeover()
             enterStep(0)
@@ -168,14 +172,18 @@ final class AppState: ObservableObject {
 
             phase = .finished
             log("全部完成 ✅ 打开 Finder 左侧「Quark」即可访问网盘")
-        } catch let e as InstallError {
-            fatalError = e.message
-            phase = .failed
-            log("失败：\(e.message)")
         } catch {
-            fatalError = error.localizedDescription
+            // 已被新一轮部署取代（重新扫码）→ 静默退出，不改写新任务的状态
+            guard generation == deployGeneration else { return }
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                phase = .idle
+                log("已取消本次操作")
+                return
+            }
+            let msg = (error as? InstallError)?.message ?? error.localizedDescription
+            fatalError = msg
             phase = .failed
-            log("失败：\(error.localizedDescription)")
+            log("失败：\(msg)")
         }
     }
 
@@ -195,6 +203,7 @@ final class AppState: ObservableObject {
     func rescan() {
         qrImage = nil
         qrHint = ""
+        // startDeploy 内部会取消旧任务并按新代际重启
         startDeploy()
     }
 

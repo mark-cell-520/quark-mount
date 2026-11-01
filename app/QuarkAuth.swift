@@ -89,20 +89,35 @@ final class QuarkAuth {
         state.qrHint = "请用夸克 APP 扫描上方二维码，并在手机上确认登录"
         state.log("二维码已生成，等待扫码（3 分钟有效）")
 
-        // 3. 轮询
+        // 3. 轮询（指数退避 + 连续失败上限 + 取消检查，杜绝无限静默重试）
         let deadline = Date().addingTimeInterval(180)
         var ticket: String?
         var left = 180
+        var failCount = 0
+        var waited = 0
         while Date() < deadline {
-            try await Task.sleep(nanoseconds: 2_000_000_000)
-            left -= 2
-            state.qrCountdown = max(0, left)
+            if Task.isCancelled { throw CancellationError() }
+            // 退避：2s 起，连续失败翻倍（2→4→8s，封顶 8s）
+            let backoff = min(8, 2 << min(failCount, 2))
+            try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+            waited += backoff
+            left = max(0, 180 - waited)
+            state.qrCountdown = left
             guard let pollURL = URL(string: "https://uop.quark.cn/cas/ajax/getServiceTicketByQrcodeToken?client_id=532&v=1.2&token=\(token)&request_id=\(UUID().uuidString)") else { continue }
             var preq = URLRequest(url: pollURL)
+            preq.timeoutInterval = 15
             preq.setValue(ua, forHTTPHeaderField: "User-Agent")
             preq.setValue("https://pan.quark.cn/", forHTTPHeaderField: "Referer")
             guard let (pd, _) = try? await URLSession.shared.data(for: preq),
-                  let pj = (try? JSONSerialization.jsonObject(with: pd) as? [String: Any]) else { continue }
+                  let pj = try? JSONSerialization.jsonObject(with: pd) as? [String: Any] else {
+                failCount += 1
+                state.qrHint = "网络波动，重试中…（\(failCount)/5）"
+                if failCount >= 5 {
+                    throw InstallError(message: "扫码状态检查失败：网络不通（连续 \(failCount) 次失败），请检查网络后重试")
+                }
+                continue
+            }
+            failCount = 0
             let st = pj["status"] as? Int ?? 0
             if st == 2000000 {
                 ticket = ((pj["data"] as? [String: Any])?["members"] as? [String: Any])?["service_ticket"] as? String
@@ -112,9 +127,10 @@ final class QuarkAuth {
                 state.qrHint = "二维码已过期"
                 throw InstallError(message: "二维码已过期，请重新开始")
             } else if st == 50004001 {
-                state.qrHint = "等待扫码…（\(max(0, left)) 秒后过期）"
+                state.qrHint = "等待扫码…（\(left) 秒后过期）"
             }
         }
+        if Task.isCancelled { throw CancellationError() }
         guard let ticket else {
             throw InstallError(message: "扫码超时，请重新开始")
         }
