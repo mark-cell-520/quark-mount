@@ -820,8 +820,12 @@ final class Installer {
                     "--vfs-cache-max-size", "20G",
                     "--vfs-cache-min-free-space", "2G",   // 5G 会在小磁盘上整体停用缓存（AUDIT LOW）
                     "--vfs-cache-poll-interval", "5m",   // 后台缓存检查 1m→5m（省 CPU）
-                    "--vfs-read-ahead", "64M",           // 顺序读预取：大文件/视频不卡顿
-                    "--buffer-size", "32M",
+                    // read-ahead 0（v1.1.1 实测调整）：Finder 给每个文件取缩略图只读几十 KB，
+                    // 而 read-ahead 64M 会把小文件整个拉下来（实测每文件 5MB、8 文件 40MB，
+                    // 开个相册文件夹带宽就被榨干）。关掉后缩略图只拉 64KB/文件（80 倍落差），
+                    // 顺序读实测反而更快（10MB/1.25s = 8MB/s）。缓存模式下二次访问仍秒开。
+                    "--vfs-read-ahead", "0",
+                    "--buffer-size", "8M",              // 32M→8M：多文件并发打开时每句柄缓冲区降 4 倍，RSS 无回归
                     "--transfers", "8",                  // 并行传输（目录列举/多文件更快）
                     "--checkers", "8",
                     "--dir-cache-time", "10m",           // 目录缓存：重复进目录秒开
@@ -835,6 +839,11 @@ final class Installer {
                     "--vfs-write-back", "30s",           // 写后 30s 回传：拷贝/保存立即完成不卡
                     "--noapplexattr",
                     "--volname", "Quark",
+                    // RC 接口：守护进程经它刷新目录缓存（挂载后预热）。launchd 上下文
+                    // 无权限穿越 FUSE 挂载点（实测 EPERM），但可以走 HTTP 让挂载进程自己列举
+                    "--rc",
+                    "--rc-addr", "127.0.0.1:5573",
+                    "--rc-no-auth",
                     "--daemon",
                     "--log-file", base.appendingPathComponent("mount.log").path,
                     "--log-level", "INFO"]
@@ -890,18 +899,25 @@ final class Installer {
         let sh = """
         #!/bin/bash
         # 夸克网盘守护：kext -> OpenList(循环内健康检查) -> 挂载(后台跑，循环持续照看)
-        # 关键设计（v1.1.0 加固，全部来自实测教训）：
+        # 关键设计（v1.1.0 起，v1.1.1 加固，全部来自实测教训）：
         #  1. rclone 必须后台化——前台运行会堵住循环，服务检查永远跑不到
         #  2. 挂载健康 = 条目存在 **且** rclone 进程活着——只用 mount | grep 会被僵尸挂载骗过
         #     （rclone 被 kill -9/崩溃后条目残留、ls 报 Device not configured，守护却永不重挂）
         #  3. 任何故障路径只 log + sleep，绝不 exit——KeepAlive 下 exit = 每秒重启的崩溃循环
-        #  4. EBUSY 恢复只认本次尝试的新增日志——陈旧 busy 行会误杀刚拉起的健康 rclone
-        #  5. rclone.conf 是挂载硬前置，缺失时等待而不是反复空跑刷日志
+        #  4. rclone.conf 是挂载硬前置，缺失时等待而不是反复空跑刷日志
+        #  5. 服务健康 = Web UI 活着 **且** WebDAV 真能列举——OpenList 的 SQLite 卡死时
+        #     / 返回 200 但 PROPFIND 全部 500（实测毒化 8 小时），只查 / 的守护永远发现不了
+        #  6. EBUSY 恢复不要求「有残留进程」——rclone CRITICAL 退出后挂载点 vnode 仍可能
+        #     卡死（实测），此时 pgrep 永远为空，加了进程条件反而永不恢复
+        #  7. 缓存预热走 rclone RC 接口（HTTP），不走 FUSE——launchd 上下文无权限穿越
+        #     挂载点（实测 Operation not permitted），但可以让挂载进程自己列举
         BASE="\(base.path)"
         LOG="$BASE/start-all.log"
         MLOG="$BASE/mount.log"
         MOUNTPT="\(mountPoint.path)"
         RCLONE="$BASE/bin/rclone"
+        RCADDR="127.0.0.1:5573"
+        PW="$(cat "$BASE/.admin-pass" 2>/dev/null)"
         log(){ echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 
         # 日志轮换（无界增长：INFO 级 + vfs-cache full 事件量，常驻数月可达数十 MB）
@@ -914,22 +930,67 @@ final class Installer {
         # 挂载健康判定：条目 + 进程双条件（僵尸条目不算健康）
         mount_ok(){ mount | grep -q " on $MOUNTPT " && pgrep -f 'Application Support/QuarkMount/rclone.conf' >/dev/null 2>&1; }
 
+        # 服务健康判定：0=健康 1=没起来 2=活着但功能坏（WebDAV 500）。
+        # 404=存储还没建（部署中）不算坏；超时/网络波动不重启（避免循环重启）
+        svc_ok(){
+          curl -s --fail -o /dev/null --max-time 3 http://127.0.0.1:5244/ || return 1
+          local code
+          code=$(curl -s -o /dev/null --max-time 8 -w '%{http_code}' -X PROPFIND \
+            -H "Depth: 0" -u "admin:$PW" http://127.0.0.1:5244/dav/quark/ 2>/dev/null)
+          case "$code" in
+            207|404) return 0 ;;
+            500|502|503) return 2 ;;
+            *) return 0 ;;
+          esac
+        }
+
+        # 挂载后缓存预热：经 rclone RC 接口让挂载进程自己列举根目录 + 各顶层目录。
+        # 不用 ls 挂载点——launchd 上下文无权限穿越 FUSE（实测 Operation not permitted）；
+        # 也不用 glob——它要对每个条目 stat，同样被权限挡掉（实测空列表）。
+        # vfs/refresh 会把列举结果写进挂载进程的目录缓存，用户之后打开 Finder 直接命中。
+        warm_cache(){
+          (
+            sleep 2
+            curl -s --max-time 15 -X POST "http://$RCADDR/vfs/refresh?dir=quark/" -o /dev/null 2>&1
+            names=$(curl -s --max-time 15 -X POST "http://$RCADDR/operations/list" \
+              -H "Content-Type: application/json" -d '{"fs":"quark:","remote":"quark"}' 2>/dev/null \
+              | grep -o '"Name": *"[^"]*"' | cut -d'"' -f4)
+            n=0
+            for name in $names; do
+              enc=$(/usr/bin/python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$name" 2>/dev/null)
+              [ -z "$enc" ] && continue
+              curl -s --max-time 15 -X POST "http://$RCADDR/vfs/refresh?dir=quark/$enc" -o /dev/null 2>&1 &
+              n=$((n+1))
+              [ $((n % 3)) -eq 0 ] && wait
+            done
+            wait
+            log "缓存预热完成（根目录 + $n 个顶层目录，经 RC）"
+          ) >/dev/null 2>&1 &
+        }
+
         if ! kextstat 2>/dev/null | grep -q macfuse; then
           /Library/Filesystems/macfuse.fs/Contents/Resources/load_macfuse >> "$LOG" 2>&1 || log "kext 加载失败"
         fi
 
         while true; do
           rotate
-          # —— 服务健康检查（--fail：5xx 也视为异常，与 App 侧 serviceRunning 语义一致）——
-          if ! curl -s --fail -o /dev/null --max-time 3 http://127.0.0.1:5244/; then
+          # —— 服务健康检查（Web UI + WebDAV 功能双探测）——
+          svc_ok; SC=$?
+          if [ $SC -ne 0 ]; then
             # 数据目录不存在（卸载残留/被误删）：绝不能 exit——KeepAlive 会立刻重启形成崩溃循环
             if [ ! -d "$BASE" ] || [ ! -x "$BASE/bin/openlist" ]; then
               log "数据目录或组件缺失（$BASE），60s 后重试；如已卸载请删除 LaunchAgent"
               sleep 60
               continue
             fi
+            if [ $SC -eq 2 ]; then
+              # 活着但功能坏（实测：SQLite 卡死时 PROPFIND 全 500，Web UI 却正常）→ 杀了重启
+              log "WebDAV 功能异常（PROPFIND 500），重启 OpenList"
+              pkill -f 'Application Support/QuarkMount/bin/openlist' 2>/dev/null
+              sleep 1
+            fi
             cd "$BASE" || true
-            OPENLIST_ADMIN_PASSWORD="$(cat "$BASE/.admin-pass" 2>/dev/null)" nohup "$BASE/bin/openlist" server >> "$BASE/openlist.log" 2>&1 &
+            OPENLIST_ADMIN_PASSWORD="$PW" nohup "$BASE/bin/openlist" server >> "$BASE/openlist.log" 2>&1 &
             log "OpenList 启动中…"
             for _ in $(seq 1 30); do
               curl -s --fail -o /dev/null --max-time 2 http://127.0.0.1:5244/ && break
@@ -960,7 +1021,7 @@ final class Installer {
             # 记录日志行数：EBUSY 判断只认本次尝试的新增行（陈旧 busy 行会误杀健康 rclone）
             MARK=$(wc -l < "$MLOG" 2>/dev/null || echo 0)
             log "开始挂载"
-            "$RCLONE" mount quark:/ "$MOUNTPT" --config "$BASE/rclone.conf" --vfs-cache-mode full --cache-dir "$BASE/vfs-cache" --vfs-cache-max-size 20G --vfs-cache-min-free-space 2G --vfs-cache-poll-interval 5m --vfs-read-ahead 64M --buffer-size 32M --vfs-write-back 30s --transfers 8 --checkers 8 --dir-cache-time 10m --attr-timeout 10m --poll-interval 0 --timeout 30s --contimeout 10s --low-level-retries 3 --retries 3 --no-checksum --noapplexattr --volname Quark --log-file "$MLOG" --log-level INFO &
+            "$RCLONE" mount quark:/ "$MOUNTPT" --config "$BASE/rclone.conf" --vfs-cache-mode full --cache-dir "$BASE/vfs-cache" --vfs-cache-max-size 20G --vfs-cache-min-free-space 2G --vfs-cache-poll-interval 5m --vfs-read-ahead 0 --buffer-size 8M --vfs-write-back 30s --transfers 8 --checkers 8 --dir-cache-time 10m --attr-timeout 10m --poll-interval 0 --timeout 30s --contimeout 10s --low-level-retries 3 --retries 3 --no-checksum --noapplexattr --volname Quark --rc --rc-addr "$RCADDR" --rc-no-auth --log-file "$MLOG" --log-level INFO &
             ok=0
             for _ in $(seq 1 30); do
               sleep 1
@@ -968,12 +1029,14 @@ final class Installer {
             done
             if [ "$ok" = "1" ]; then
               log "挂载成功"
+              warm_cache
             else
               log "挂载未就绪"
-              # EBUSY 自恢复：只认本次新增日志 **且** 确有残留 rclone 进程，才清理重建目录节点
+              # EBUSY 自恢复：本次尝试产生了 busy 行就恢复——不要求残留进程存在
+              # （rclone CRITICAL 退出后 vnode 仍卡死是实测场景，加了进程条件反而永不恢复）
               NEWBUSY=$(tail -n +$((MARK + 1)) "$MLOG" 2>/dev/null | tail -20 | grep -ci busy)
-              if [ "${NEWBUSY:-0}" -gt 0 ] && pgrep -f 'Application Support/QuarkMount/rclone.conf' >/dev/null 2>&1; then
-                log "挂载点被残留进程占用，执行恢复"
+              if [ "${NEWBUSY:-0}" -gt 0 ]; then
+                log "挂载点被占用，执行恢复"
                 pkill -9 -f 'Application Support/QuarkMount/rclone.conf' 2>/dev/null
                 sleep 1
                 rmdir "$MOUNTPT" 2>/dev/null
